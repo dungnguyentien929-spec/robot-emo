@@ -1,0 +1,11 @@
+{
+    "type": "robot-emo",
+    "target": "esp32s3",
+    "builds": [
+        {
+            "name": "robot-emo",
+            "sdkconfig_append": [
+            ]
+        }
+    ]
+}

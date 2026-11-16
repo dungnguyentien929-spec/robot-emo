@@ -1,0 +1,2 @@
+set(BUILTIN_TEXT_FONT font_noto_sans_basic_14_1)
+set(BUILTIN_ICON_FONT font_material_symbols_14_1)
