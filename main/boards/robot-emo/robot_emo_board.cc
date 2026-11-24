@@ -9,6 +9,7 @@
 
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <esp_rom_sys.h>
 #include <esp_heap_caps.h>  // DIAGNOSTIC, REMOVE LATER (SRAM log)
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
@@ -16,7 +17,7 @@
 #include <esp_lcd_panel_vendor.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
-#include <atomic>  // DIAGNOSTIC, REMOVE LATER (SRAM log)
+#include <atomic>
 #include <new>
 #include <string>
 #include <utility>
@@ -30,6 +31,12 @@
 
 namespace {
 
+// Motor direction inversion (firmware fix for mirrored motor mounting, no rewiring).
+// true swaps that motor's two L298N input levels for every direction, so its wheel turns
+// the other way. Flip one if that wheel spins backwards on "forward".
+constexpr bool kInvertMotorA = false;  // Motor A: IN1/IN2 = GPIO11/GPIO12
+constexpr bool kInvertMotorB = true;   // Motor B: IN3/IN4 = GPIO13/GPIO14
+
 constexpr gpio_num_t kMotorPins[] = {
     GPIO_NUM_11, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_14
 };
@@ -37,7 +44,10 @@ constexpr uint8_t kMax30102Address = 0x57;
 constexpr uint8_t kMax30102PartId = 0x15;
 constexpr uint32_t kFingerThreshold = 50000;
 constexpr uint64_t kHeartRateStaleUs = 2500000;
-constexpr uint64_t kDiagnosticWindowUs = 15000000;
+// MAX30102 LED1 (red) and LED2 (IR) pulse amplitude, registers 0x0C/0x0D: 0.2 mA/LSB, 0x3C = 12 mA.
+constexpr uint8_t kLedCurrent = 0x3C;
+// DIAGNOSTIC, REMOVE LATER: log raw IR samples ("HRRAW,...") for up to 20 s per finger placement.
+constexpr bool kHeartRateRawCapture = true;
 
 class MotorDriver {
 private:
@@ -146,6 +156,13 @@ public:
         } else {
             return ESP_ERR_INVALID_ARG;
         }
+        // The table above is logical wheel motion; apply mounting inversion here only.
+        if (kInvertMotorA) {
+            std::swap(levels[0], levels[1]);
+        }
+        if (kInvertMotorB) {
+            std::swap(levels[2], levels[3]);
+        }
 
         if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE) {
             return ESP_ERR_TIMEOUT;
@@ -199,7 +216,11 @@ private:
     i2c_master_dev_handle_t device_ = nullptr;
     TaskHandle_t task_ = nullptr;
     SemaphoreHandle_t mutex_ = nullptr;
-    std::string init_error_ = "MAX30102 is not initialized";
+    std::string init_error_ = "MAX30102 is not initialized";  // guarded by init_mutex_
+    SemaphoreHandle_t init_mutex_ = nullptr;  // serializes Init() between boot and tool retries
+    std::atomic<bool> ready_{false};
+    int64_t last_init_attempt_us_ = 0;
+    char scan_line_[112 * 5 + 8] = {};  // DIAGNOSTIC, REMOVE LATER: I2C scan result
 
     int32_t ir_baseline_ = 0;
     int32_t previous_ac_ = 0;
@@ -209,9 +230,26 @@ private:
     uint64_t last_beat_us_ = 0;
     int latest_bpm_ = 0;
 
-    // Raw IR/baseline diagnostics, logged once per second for a window after each tool call.
-    uint64_t diag_until_us_ = 0;
-    uint64_t last_diag_log_us_ = 0;
+    // DIAGNOSTIC, REMOVE LATER: HRDIAG/HRRAW signal logging. Touched only by the sensor task,
+    // so it needs no lock.
+    static constexpr uint32_t kDiagMinIr = 10000;
+    static constexpr uint64_t kRawCaptureUs = 20000000;
+    static constexpr uint64_t kRawRearmUs = 3000000;
+    static constexpr size_t kRawMaxSamples = 40;  // per 1 s line; the FIFO delivers ~25/s
+    uint64_t diag_window_start_us_ = 0;  // 0: no 1 s window open
+    uint32_t diag_ir_min_ = 0;
+    uint32_t diag_ir_max_ = 0;
+    int32_t diag_ac_min_ = 0;
+    int32_t diag_ac_max_ = 0;
+    bool diag_has_ac_ = false;
+    uint32_t diag_samples_ = 0;
+    bool raw_armed_ = true;
+    uint64_t raw_start_us_ = 0;
+    uint64_t below_since_us_ = 0;
+    uint64_t raw_line_start_us_ = 0;
+    uint32_t raw_samples_[kRawMaxSamples] = {};
+    size_t raw_count_ = 0;
+    char raw_line_[kRawMaxSamples * 8 + 32] = {};
 
     bool ReadRegister(uint8_t reg, uint8_t* data, size_t length) {
         return i2c_master_transmit_receive(device_, &reg, 1, data, length, 100) == ESP_OK;
@@ -227,11 +265,12 @@ private:
     }
 
     void UpdateBeat(uint32_t ir, uint64_t now_us) {
-        int32_t log_baseline = 0;
-        bool log_sample = false;
+        const bool finger = ir > kFingerThreshold;
+        int32_t ac = 0;
+        int32_t peak_threshold = 0;
         xSemaphoreTake(mutex_, portMAX_DELAY);
 
-        if (ir <= kFingerThreshold) {
+        if (!finger) {
             ir_baseline_ = 0;
             previous_ac_ = 0;
             interval_count_ = 0;
@@ -243,9 +282,9 @@ private:
                 ir_baseline_ = static_cast<int32_t>(ir);
             }
             ir_baseline_ += (static_cast<int32_t>(ir) - ir_baseline_) / 32;
-            const int32_t ac = static_cast<int32_t>(ir) - ir_baseline_;
+            ac = static_cast<int32_t>(ir) - ir_baseline_;
             const int32_t threshold = ir_baseline_ / 200;
-            const int32_t peak_threshold = threshold > 200 ? threshold : 200;
+            peak_threshold = threshold > 200 ? threshold : 200;
 
             if (previous_ac_ <= peak_threshold && ac > peak_threshold &&
                 (last_beat_us_ == 0 || now_us - last_beat_us_ >= 300000)) {
@@ -281,17 +320,90 @@ private:
             }
         }
 
-        if (now_us < diag_until_us_ && now_us - last_diag_log_us_ >= 1000000) {
-            last_diag_log_us_ = now_us;
-            log_baseline = ir_baseline_;
-            log_sample = true;
+        const int32_t baseline = ir_baseline_;
+        const size_t beats = interval_count_;
+        xSemaphoreGive(mutex_);
+        UpdateDiagnostics(ir, now_us, finger, baseline, ac, peak_threshold, beats);
+    }
+
+    // DIAGNOSTIC, REMOVE LATER: while IR > 10000, logs one HRDIAG summary line per second and,
+    // if kHeartRateRawCapture, one HRRAW line per second with every IR sample of that second.
+    // HRRAW covers at most 20 s after the finger is first seen; it re-arms after IR stays at
+    // or below 10000 for 3 s. HRRAW's <ms> is the line's first sample, in ms since capture start.
+    void UpdateDiagnostics(uint32_t ir, uint64_t now_us, bool finger, int32_t baseline,
+                           int32_t ac, int32_t peak_threshold, size_t beats) {
+        if (ir <= kDiagMinIr) {
+            diag_window_start_us_ = 0;
+            raw_count_ = 0;
+            if (below_since_us_ == 0) {
+                below_since_us_ = now_us;
+            }
+            if (!raw_armed_ && now_us - below_since_us_ >= kRawRearmUs) {
+                raw_armed_ = true;
+            }
+            return;
+        }
+        below_since_us_ = 0;
+
+        if (diag_window_start_us_ == 0) {
+            diag_window_start_us_ = now_us;
+            diag_ir_min_ = ir;
+            diag_ir_max_ = ir;
+            diag_has_ac_ = false;
+            diag_samples_ = 0;
+        }
+        diag_ir_min_ = ir < diag_ir_min_ ? ir : diag_ir_min_;
+        diag_ir_max_ = ir > diag_ir_max_ ? ir : diag_ir_max_;
+        if (finger) {
+            if (!diag_has_ac_) {
+                diag_ac_min_ = ac;
+                diag_ac_max_ = ac;
+                diag_has_ac_ = true;
+            }
+            diag_ac_min_ = ac < diag_ac_min_ ? ac : diag_ac_min_;
+            diag_ac_max_ = ac > diag_ac_max_ ? ac : diag_ac_max_;
+        }
+        ++diag_samples_;
+
+        if (kHeartRateRawCapture) {
+            if (raw_armed_) {
+                raw_armed_ = false;
+                raw_start_us_ = now_us;
+                raw_count_ = 0;
+            }
+            if (now_us - raw_start_us_ <= kRawCaptureUs && raw_count_ < kRawMaxSamples) {
+                if (raw_count_ == 0) {
+                    raw_line_start_us_ = now_us;
+                }
+                raw_samples_[raw_count_++] = ir;
+            }
         }
 
-        xSemaphoreGive(mutex_);
-        if (log_sample) {
-            ESP_LOGI(TAG, "MAX30102 diag sample: IR=%lu baseline=%ld finger_threshold=%lu",
-                     static_cast<unsigned long>(ir), static_cast<long>(log_baseline),
-                     static_cast<unsigned long>(kFingerThreshold));
+        if (now_us - diag_window_start_us_ < 1000000) {
+            return;
+        }
+        ESP_LOGI(TAG,
+                 "HRDIAG ir_min=%lu ir_max=%lu baseline=%ld ac_min=%ld ac_max=%ld peak_thr=%ld "
+                 "samples=%lu beats=%u/4 finger=%d",
+                 static_cast<unsigned long>(diag_ir_min_), static_cast<unsigned long>(diag_ir_max_),
+                 static_cast<long>(baseline), static_cast<long>(diag_has_ac_ ? diag_ac_min_ : 0),
+                 static_cast<long>(diag_has_ac_ ? diag_ac_max_ : 0),
+                 static_cast<long>(peak_threshold), static_cast<unsigned long>(diag_samples_),
+                 static_cast<unsigned>(beats), finger ? 1 : 0);
+        diag_window_start_us_ = 0;
+
+        if (raw_count_ > 0) {
+            int len = snprintf(raw_line_, sizeof(raw_line_), "HRRAW,%llu",
+                               static_cast<unsigned long long>(
+                                   (raw_line_start_us_ - raw_start_us_) / 1000));
+            for (size_t i = 0; i < raw_count_ && len > 0 &&
+                               len < static_cast<int>(sizeof(raw_line_));
+                 ++i) {
+                len += snprintf(raw_line_ + len, sizeof(raw_line_) - len, ",%lu",
+                                static_cast<unsigned long>(raw_samples_[i]));
+            }
+            ESP_LOGI(TAG, "%s", raw_line_);
+            raw_count_ = 0;
         }
     }
 
@@ -314,12 +426,74 @@ private:
         }
     }
 
-public:
-    HeartRateSensor() {
+    static constexpr gpio_num_t kSdaPin = GPIO_NUM_8;
+    static constexpr gpio_num_t kSclPin = GPIO_NUM_9;
+    static constexpr uint32_t kI2cSpeedHz = 100000;
+    static constexpr int kI2cTimeoutMs = 20;
+    static constexpr int kBootInitAttempts = 3;
+    static constexpr uint64_t kInitRetryUs = 2000000;
+    static constexpr uint32_t kTaskStackBytes = 5120;
+
+    void ReleaseI2c() {
+        if (device_ != nullptr) {
+            i2c_master_bus_rm_device(device_);
+            device_ = nullptr;
+        }
+        if (bus_ != nullptr) {
+            i2c_del_master_bus(bus_);
+            bus_ = nullptr;
+        }
+    }
+
+    // DIAGNOSTIC, REMOVE LATER: line levels and an address scan after a failed init attempt.
+    void LogBusDiagnostics() {
+        int sda = 0;
+        int scl = 0;
+        if (bus_ != nullptr) {
+            // The I2C driver leaves both pins open-drain, input-enabled, with internal pull-ups.
+            sda = gpio_get_level(kSdaPin);
+            scl = gpio_get_level(kSclPin);
+        } else {
+            gpio_config_t config = {};
+            config.pin_bit_mask = (1ULL << kSdaPin) | (1ULL << kSclPin);
+            config.mode = GPIO_MODE_INPUT;
+            config.pull_up_en = GPIO_PULLUP_ENABLE;
+            config.pull_down_en = GPIO_PULLDOWN_DISABLE;
+            config.intr_type = GPIO_INTR_DISABLE;
+            gpio_config(&config);
+            esp_rom_delay_us(50);
+            sda = gpio_get_level(kSdaPin);
+            scl = gpio_get_level(kSclPin);
+            gpio_reset_pin(kSdaPin);
+            gpio_reset_pin(kSclPin);
+        }
+        ESP_LOGW(TAG, "MAX30102 diag: SDA(GPIO8)=%d SCL(GPIO9)=%d with internal pull-ups", sda, scl);
+        if (bus_ == nullptr) {
+            ESP_LOGW(TAG, "MAX30102 diag: I2C scan skipped, bus was not created");
+            return;
+        }
+        if (sda == 0 || scl == 0) {
+            ESP_LOGW(TAG, "MAX30102 diag: I2C scan skipped, a line is held LOW");
+            return;
+        }
+        int len = 0;
+        scan_line_[0] = '\0';
+        for (uint16_t address = 0x08; address <= 0x77; ++address) {
+            if (i2c_master_probe(bus_, address, kI2cTimeoutMs) == ESP_OK &&
+                len < static_cast<int>(sizeof(scan_line_))) {
+                len += snprintf(scan_line_ + len, sizeof(scan_line_) - len, " 0x%02X", address);
+            }
+        }
+        ESP_LOGW(TAG, "MAX30102 diag: I2C scan 0x08-0x77 ACK:%s", len > 0 ? scan_line_ : " none");
+    }
+
+    // One probe/configure attempt. On failure, sets init_error_ and leaves bus_/device_ for the
+    // caller to diagnose and release.
+    bool TryInitOnce() {
         i2c_master_bus_config_t bus_config = {
             .i2c_port = I2C_NUM_1,
-            .sda_io_num = GPIO_NUM_8,
-            .scl_io_num = GPIO_NUM_9,
+            .sda_io_num = kSdaPin,
+            .scl_io_num = kSclPin,
             .clk_source = I2C_CLK_SRC_DEFAULT,
             .glitch_ignore_cnt = 7,
             .intr_priority = 0,
@@ -328,71 +502,137 @@ public:
         };
         esp_err_t err = i2c_new_master_bus(&bus_config, &bus_);
         if (err != ESP_OK) {
+            bus_ = nullptr;
             init_error_ = "Failed to initialize MAX30102 I2C bus 2: " +
                           std::string(esp_err_to_name(err));
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            return;
+            return false;
         }
 
-        err = i2c_master_probe(bus_, kMax30102Address, 100);
+        err = i2c_master_probe(bus_, kMax30102Address, kI2cTimeoutMs);
         if (err != ESP_OK) {
             init_error_ = "MAX30102 not found at I2C address 0x57";
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            i2c_del_master_bus(bus_);
-            bus_ = nullptr;
-            return;
+            return false;
         }
 
         i2c_device_config_t device_config = {
             .dev_addr_length = I2C_ADDR_BIT_LEN_7,
             .device_address = kMax30102Address,
-            .scl_speed_hz = 400000,
+            .scl_speed_hz = kI2cSpeedHz,
             .scl_wait_us = 0,
             .flags = {.disable_ack_check = 0},
         };
         err = i2c_master_bus_add_device(bus_, &device_config, &device_);
+        if (err != ESP_OK) {
+            device_ = nullptr;
+            init_error_ = "Failed to add MAX30102 I2C device: " + std::string(esp_err_to_name(err));
+            return false;
+        }
         uint8_t part_id = 0;
-        if (err != ESP_OK || !ReadRegister(0xFF, &part_id, 1) || part_id != kMax30102PartId) {
-            init_error_ = "MAX30102 at 0x57 did not respond with the expected part ID";
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            return;
+        if (!ReadRegister(0xFF, &part_id, 1)) {
+            init_error_ = "MAX30102 at 0x57 did not answer the part-ID read";
+            return false;
+        }
+        if (part_id != kMax30102PartId) {
+            // DIAGNOSTIC, REMOVE LATER: something ACKs at 0x57 but is not a MAX30102.
+            ESP_LOGW(TAG, "MAX30102 diag: device at 0x57 has part ID 0x%02X, expected 0x%02X",
+                     part_id, kMax30102PartId);
+            char message[80];
+            snprintf(message, sizeof(message),
+                     "Device at I2C address 0x57 has part ID 0x%02X, expected 0x15", part_id);
+            init_error_ = message;
+            return false;
         }
 
         if (!WriteRegister(0x09, 0x40)) {
             init_error_ = "Failed to reset MAX30102";
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            return;
+            return false;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
         if (!WriteRegister(0x08, 0x4F) || !WriteRegister(0x09, 0x03) ||
-            !WriteRegister(0x0A, 0x27) || !WriteRegister(0x0C, 0x24) ||
-            !WriteRegister(0x0D, 0x24) || !WriteRegister(kRegFifoWritePtr, 0) ||
+            !WriteRegister(0x0A, 0x27) || !WriteRegister(0x0C, kLedCurrent) ||
+            !WriteRegister(0x0D, kLedCurrent) || !WriteRegister(kRegFifoWritePtr, 0) ||
             !WriteRegister(0x05, 0) || !WriteRegister(kRegFifoReadPtr, 0)) {
             init_error_ = "Failed to configure MAX30102";
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            return;
+            return false;
         }
+        return true;
+    }
 
-        mutex_ = xSemaphoreCreateMutex();
-        if (mutex_ == nullptr) {
-            init_error_ = "Failed to create MAX30102 state mutex";
-            ESP_LOGE(TAG, "%s", init_error_.c_str());
-            return;
+    // One full attempt; the caller holds init_mutex_. A failed attempt logs bus diagnostics and
+    // releases the I2C bus and device handles so the next attempt starts clean.
+    bool Init() {
+        last_init_attempt_us_ = esp_timer_get_time();
+        if (!TryInitOnce()) {
+            LogBusDiagnostics();
+            ReleaseI2c();
+            return false;
         }
-        if (xTaskCreate(SensorTask, "heart_rate", 4096, this, 1, &task_) != pdPASS) {
+        if (task_ == nullptr &&
+            xTaskCreate(SensorTask, "heart_rate", kTaskStackBytes, this, 1, &task_) != pdPASS) {
             task_ = nullptr;
             init_error_ = "Failed to create MAX30102 sensor task";
+            ReleaseI2c();
+            return false;
+        }
+        init_error_.clear();
+        ready_ = true;
+        ESP_LOGI(TAG, "MAX30102 found at 0x57 (I2C %lu Hz); sensor task stack=%lu bytes, priority=1",
+                 static_cast<unsigned long>(kI2cSpeedHz), static_cast<unsigned long>(kTaskStackBytes));
+        return true;
+    }
+
+public:
+    HeartRateSensor() {
+        mutex_ = xSemaphoreCreateMutex();
+        init_mutex_ = xSemaphoreCreateMutex();
+        if (mutex_ == nullptr || init_mutex_ == nullptr) {
+            init_error_ = "Failed to create MAX30102 mutexes";
             ESP_LOGE(TAG, "%s", init_error_.c_str());
             return;
         }
-        init_error_.clear();
-        ESP_LOGI(TAG, "MAX30102 found at 0x57; sensor task stack=4096 bytes, priority=1");
+        xSemaphoreTake(init_mutex_, portMAX_DELAY);
+        const int64_t start_us = esp_timer_get_time();
+        for (int attempt = 1; attempt <= kBootInitAttempts; ++attempt) {
+            if (Init()) {
+                break;
+            }
+            ESP_LOGW(TAG, "MAX30102 init attempt %d/%d failed: %s", attempt, kBootInitAttempts,
+                     init_error_.c_str());
+            if (attempt < kBootInitAttempts) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+            }
+        }
+        if (!ready_) {
+            ESP_LOGE(TAG, "MAX30102 unavailable after %d attempts (%lld ms); the tool retries later",
+                     kBootInitAttempts, (esp_timer_get_time() - start_us) / 1000);
+        }
+        xSemaphoreGive(init_mutex_);
     }
 
     // Non-blocking: runs on the main event loop, so it only reads the sampler task's state.
+    // If the sensor is not ready, it makes at most one init attempt per 2 s.
     ToolResult GetHeartRate() {
-        if (task_ == nullptr) {
-            return std::unexpected(init_error_);
+        if (!ready_) {
+            if (mutex_ == nullptr || init_mutex_ == nullptr) {
+                return std::unexpected(init_error_);
+            }
+            if (xSemaphoreTake(init_mutex_, 0) != pdTRUE) {
+                return std::unexpected(
+                    std::string("Heart-rate sensor initialization is in progress; ask again shortly."));
+            }
+            if (!ready_ && esp_timer_get_time() - last_init_attempt_us_ >= kInitRetryUs) {
+                if (!Init()) {
+                    ESP_LOGW(TAG, "MAX30102 init retry failed: %s", init_error_.c_str());
+                }
+            }
+            const bool ready = ready_;
+            const std::string error = init_error_;
+            xSemaphoreGive(init_mutex_);
+            if (!ready) {
+                return std::unexpected("Heart-rate sensor unavailable (last init error: " + error +
+                                       "). Check the MAX30102 wiring; the robot retries at most "
+                                       "every 2 seconds.");
+            }
         }
 
         const uint64_t now_us = esp_timer_get_time();
@@ -401,8 +641,6 @@ public:
                            now_us - last_beat_us_ <= kHeartRateStaleUs;
         const int bpm = latest_bpm_;
         const size_t beats = interval_count_;
-        diag_until_us_ = now_us + kDiagnosticWindowUs;
-        last_diag_log_us_ = 0;  // log the next sample, then once per second
         xSemaphoreGive(mutex_);
 
         if (fresh) {
