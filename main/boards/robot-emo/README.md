@@ -93,3 +93,48 @@ Heart-rate results are reference values only, not medical measurements.
 
 During startup, click BOOT to enter Wi-Fi provisioning. After startup, click
 BOOT to toggle chat/listening, matching the Bread Compact Wi-Fi behavior.
+
+## Wake word: "alo tí ơi"
+
+This board replaces the stock WakeNet "Hi ESP" with a MultiNet custom wake
+word (`mn7_cn`). BOOT click still toggles chat as a fallback. ESP-SR has no
+Vietnamese model, so the phrase is approximated with toneless pinyin. Three
+spellings are registered as separate wake commands, so the log shows which one
+matched.
+
+It is configured in `config.json`:
+
+- `"wake_word": "custom"` makes `scripts/build.py` select
+  `CONFIG_USE_CUSTOM_WAKE_WORD` instead of a WakeNet model. `--wake-word`
+  on the command line still overrides it.
+- `CONFIG_SR_MN_CN_MULTINET7_QUANT=y` packs `mn7_cn` into the assets.
+- `CONFIG_CUSTOM_WAKE_WORD` holds the spellings, separated by `|`. Each must be
+  valid toneless pinyin syllables separated by spaces (no Vietnamese letters).
+  Keep the best one or two once you have test results; fewer commands means
+  fewer false triggers.
+- `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` is the text sent to the server on wake.
+- `CONFIG_CUSTOM_WAKE_WORD_THRESHOLD` is 1-99 (divided by 100). Lower is more
+  sensitive. Start at 20; raise it if there are false triggers, lower it if
+  real attempts are missed.
+
+Rebuild after any change: the build regenerates `index.json` and
+`generated_assets.bin`, and `idf.py flash` writes both the app and the assets
+partition.
+
+Serial log lines to watch:
+
+- `CustomWakeWord: Command: <spelling>, Text: alo tí ơi, Action: wake` at boot,
+  one per spelling.
+- `CustomWakeWord: Custom wake word detected: command_id=N, string=..., prob=...`
+  on every detection. N is the spelling's position (1-3). Detections while no
+  one said the phrase are false triggers.
+- `Initialized FD AFE, detector: MultiNet, ...` confirms MultiNet replaced
+  WakeNet; the `After AFE create: free=... min=...` line right after it also
+  shows internal SRAM.
+- `RobotEmoBoard: Internal SRAM (after audio engine start|20 s after
+  conversation end): min free=... free now=...` to compare with the ~48 KB
+  minimum free internal SRAM seen with WakeNet.
+
+Suggested test: 20 attempts per spelling at about 1 m and 3 m, then 10 minutes
+of TV or conversation nearby with no wake attempts. Count detections per
+`command_id` and false triggers, then adjust the spellings and threshold.
