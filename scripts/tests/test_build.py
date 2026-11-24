@@ -178,6 +178,10 @@ class VersionTests(unittest.TestCase):
             config = json.loads(config_path.read_text(encoding="utf-8"))
             for build_config in config.get("builds", []):
                 for option in build_config.get("sdkconfig_append", []):
+                    # robot-emo: its MultiNet custom wake-word phrases live in config.json.
+                    if (config_path.parent.name == "robot-emo"
+                            and option.startswith("CONFIG_CUSTOM_WAKE_WORD")):
+                        continue
                     self.assertFalse(
                         option.startswith("CONFIG_LANGUAGE_")
                         or option.startswith("CONFIG_SR_WN_")
@@ -1071,6 +1075,16 @@ class BuildOptionTests(unittest.TestCase):
         self.assertIn("CONFIG_WAKE_WORD_DISABLED=y", options)
         self.assertEqual(symbols, ["CONFIG_WAKE_WORD_DISABLED"])
 
+    def test_custom_wake_word_selects_multinet(self):  # robot-emo
+        model, options, symbols = build._wake_word_sdkconfig_options("custom", "esp32s3")
+        self.assertEqual(model, "custom")
+        self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", options)
+        self.assertIn("CONFIG_USE_AFE_WAKE_WORD=n", options)
+        self.assertFalse(any(option.startswith("CONFIG_SR_WN_") for option in options))
+        self.assertEqual(symbols, ["CONFIG_USE_CUSTOM_WAKE_WORD"])
+        with self.assertRaisesRegex(ValueError, "Custom wake word requires"):
+            build._wake_word_sdkconfig_options("custom", "esp32c3")
+
     def test_incompatible_wake_word_model_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "WakeNet9s"):
             build._wake_word_sdkconfig_options(
@@ -1577,6 +1591,11 @@ class LanguageBuildTests(unittest.TestCase):
                         )
                         validate.assert_any_call([expected.split("=", 1)[0]], "--language")
                         models = [item for item in fragment if item.startswith("CONFIG_SR_WN_")]
+                        if variant["board"] == "robot-emo":  # robot-emo: defaults to custom MultiNet
+                            self.assertEqual(models, [])
+                            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=y", fragment)
+                            validate.assert_any_call(["CONFIG_USE_CUSTOM_WAKE_WORD"], "--wake-word")
+                            continue
                         if variant["wake_word_supported"]:
                             chinese = language in {"zh-CN", "zh-TW"}
                             if target in {"esp32c3", "esp32c5", "esp32c6"}:
@@ -1593,6 +1612,19 @@ class LanguageBuildTests(unittest.TestCase):
                             self.assertEqual(models, [])
                             self.assertIn("CONFIG_WAKE_WORD_DISABLED=y", fragment)
                             validate.assert_any_call(["CONFIG_WAKE_WORD_DISABLED"], "--wake-word")
+
+    def test_robot_emo_wakenet_override_drops_multinet(self):  # robot-emo
+        with self.mock_idf() as (_, configure, validate):
+            build.build_board("robot-emo", name_filter="robot-emo", idf_version=(6, 1, 0),
+                              wake_word="wn9_hiesp")
+            fragment = configure.call_args.args[1]
+            self.assertIn("CONFIG_USE_AFE_WAKE_WORD=y", fragment)
+            self.assertIn("CONFIG_SR_WN_WN9_HIESP=y", fragment)
+            self.assertIn("CONFIG_USE_CUSTOM_WAKE_WORD=n", fragment)
+            self.assertIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=n", fragment)
+            self.assertNotIn("CONFIG_SR_MN_CN_MULTINET7_QUANT=y", fragment)
+            validate.assert_any_call(
+                ["CONFIG_USE_AFE_WAKE_WORD", "CONFIG_SR_WN_WN9_HIESP"], "--wake-word")
 
     def test_cli_default_and_explicit_locale_use_the_real_build_pipeline(self):
         with (

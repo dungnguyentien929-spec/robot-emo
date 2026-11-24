@@ -1072,12 +1072,18 @@ def main():
             "language": language,
             "duration": 3000,  # Default duration in ms
             "threshold": custom_wake_word_config['threshold'],
+            # "|" separates alternative spellings; each becomes its own wake command.
             "commands": [
                 {
-                    "command": custom_wake_word_config['wake_word'],
+                    "command": spelling,
                     "text": custom_wake_word_config['display'],
                     "action": "wake"
                 }
+                for spelling in (
+                    [w.strip() for w in custom_wake_word_config['wake_word'].split('|') if w.strip()]
+                    if '|' in custom_wake_word_config['wake_word']
+                    else [custom_wake_word_config['wake_word']]
+                )
             ]
         }
         print(f"  custom wake word: {custom_wake_word_config['wake_word']} ({custom_wake_word_config['display']})")

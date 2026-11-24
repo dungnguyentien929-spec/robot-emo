@@ -355,6 +355,13 @@ def _wake_word_sdkconfig_options(
 
     if target not in _ESP_WAKE_WORD_TARGETS | _AFE_WAKE_WORD_TARGETS:
         raise ValueError(f"Wake-word selection is not supported for target {target}")
+    # robot-emo: "custom" selects the MultiNet custom wake word. The board's
+    # sdkconfig_append supplies CONFIG_SR_MN_* and CONFIG_CUSTOM_WAKE_WORD*.
+    if normalized == "custom":
+        if target not in _AFE_WAKE_WORD_TARGETS:
+            raise ValueError(f"Custom wake word requires one of {sorted(_AFE_WAKE_WORD_TARGETS)}")
+        options.append("CONFIG_USE_CUSTOM_WAKE_WORD=y")
+        return normalized, options, ["CONFIG_USE_CUSTOM_WAKE_WORD"]
     if not _WAKE_WORD_MODEL_PATTERN.fullmatch(normalized):
         raise ValueError(
             f"Invalid wake word {wake_word!r}. Use 'disabled', "
@@ -1623,6 +1630,8 @@ def build_board(
         )
         wake_word_supported = _board_supports_wake_word(target, sdkconfig_append)
         requested_wake_word = wake_word
+        if requested_wake_word is None:  # robot-emo: optional per-build default
+            requested_wake_word = build.get("wake_word")
         if requested_wake_word is None:
             requested_wake_word = "disabled"
             if wake_word_supported:
@@ -1640,6 +1649,13 @@ def build_board(
                 "check the board opt-out and target PSRAM requirements."
             )
         user_options.extend(wake_word_options)
+        # robot-emo: a WakeNet --wake-word overrides a board "custom" default; drop the
+        # board's MultiNet model so AFE does not pick MultiNet with no commands.
+        if build.get("wake_word") == "custom" and selected_wake_word != "custom":
+            user_options.extend(
+                f"{item.split('=', 1)[0]}=n" for item in build_sdkconfig_append
+                if item.startswith("CONFIG_SR_MN_") and item.endswith("=y")
+            )
         validation_symbols.append((wake_word_symbols, "--wake-word"))
 
         # A build entry may carry semantic defaults to preserve an existing
@@ -1791,7 +1807,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         metavar="MODEL",
         help=(
             "Wake-word model (for example wn9_jarvis_tts), "
-            "'nihaoxiaozhi', 'hiesp', or 'disabled'. Defaults to nihaoxiaozhi "
+            "'nihaoxiaozhi', 'hiesp', 'custom' (MultiNet), or 'disabled'. Defaults to nihaoxiaozhi "
             "for zh-CN/zh-TW and hiesp otherwise; disabled on unsupported boards"
         ),
     )
