@@ -6,6 +6,7 @@
 #include "config.h"
 #include "led/single_led.h"
 #include "mcp_server.h"
+#include "weather_report.h"
 
 #include <esp_log.h>
 #include <esp_timer.h>
@@ -17,6 +18,7 @@
 #include <esp_lcd_panel_vendor.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <freertos/idf_additions.h>
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -53,6 +55,16 @@ constexpr uint32_t kFingerThreshold = 8000;
 constexpr uint64_t kHeartRateStaleUs = 2500000;
 // MAX30102 LED1 (red) and LED2 (IR) pulse amplitude, registers 0x0C/0x0D: 0.2 mA/LSB, 0x3C = 12 mA.
 constexpr uint8_t kLedCurrent = 0x3C;
+
+// Weather place for self.weather.get. To change it, edit these three and the URL's
+// latitude/longitude, then rebuild.
+constexpr const char* kWeatherPlace = "Thu Duc City, Ho Chi Minh City, Vietnam";
+constexpr const char* kWeatherUrl =
+    "https://api.open-meteo.com/v1/forecast?latitude=10.85&longitude=106.77"
+    "&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,"
+    "weather_code,wind_speed_10m"
+    "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
+    "&timezone=Asia%2FHo_Chi_Minh&forecast_days=2";
 
 class MotorDriver {
 private:
@@ -704,6 +716,159 @@ public:
     }
 };
 
+// Weather for one fixed place (kWeatherPlace). A low-priority task with its stack in PSRAM
+// fetches Open-Meteo over HTTPS every 15 min (1 min after a failure) into a cache; GetText()
+// only reads the cache, so the MCP tool never waits on the network.
+class WeatherService {
+private:
+    static constexpr uint32_t kStackBytes = 8192;
+    static constexpr uint32_t kRefreshMs = 15 * 60 * 1000;
+    static constexpr uint32_t kRetryMs = 60 * 1000;
+    static constexpr uint32_t kWifiPollMs = 5000;
+    static constexpr int kHttpTimeoutMs = 10000;
+    static constexpr size_t kMaxBodyBytes = 4096;
+
+    SemaphoreHandle_t mutex_ = nullptr;
+    TaskHandle_t task_ = nullptr;
+    // Guarded by mutex_.
+    bool has_report_ = false;
+    robot_emo::WeatherReport report_;
+    int64_t fetched_us_ = 0;
+    std::string last_error_;
+    bool stack_logged_ = false;  // weather task only
+
+    static void TaskEntry(void* arg) { static_cast<WeatherService*>(arg)->Run(); }
+
+    std::expected<std::string, std::string> Download() {
+        auto http = Board::GetInstance().GetNetwork()->CreateHttp(3);
+        if (http == nullptr) {
+            return std::unexpected(std::string("no HTTP client"));
+        }
+        http->SetTimeout(kHttpTimeoutMs);
+        if (auto opened = http->Open("GET", kWeatherUrl); !opened) {
+            return std::unexpected("connect failed: " + opened.error().ToString());
+        }
+        auto status = http->GetStatusCode();
+        if (!status) {
+            http->Close();
+            return std::unexpected("no response: " + status.error().ToString());
+        }
+        if (*status != 200) {
+            http->Close();
+            return std::unexpected("HTTP status " + std::to_string(*status));
+        }
+        std::string body;
+        char buffer[512];
+        while (true) {
+            auto read = http->Read(buffer, sizeof(buffer));
+            if (!read) {
+                http->Close();
+                return std::unexpected("read failed: " + read.error().ToString());
+            }
+            if (*read <= 0) {
+                break;
+            }
+            body.append(buffer, static_cast<size_t>(*read));
+            if (body.size() > kMaxBodyBytes) {
+                http->Close();
+                return std::unexpected(std::string("response larger than 4 KB"));
+            }
+        }
+        http->Close();
+        return body;
+    }
+
+    // One fetch; returns the delay before the next one.
+    uint32_t FetchOnce() {
+        const int64_t start_us = esp_timer_get_time();
+        auto body = Download();
+        std::expected<robot_emo::WeatherReport, std::string> report =
+            body ? robot_emo::ParseOpenMeteo(*body)
+                 : std::expected<robot_emo::WeatherReport, std::string>(
+                       std::unexpected(body.error()));
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        if (report) {
+            report_ = *report;
+            has_report_ = true;
+            fetched_us_ = esp_timer_get_time();
+            last_error_.clear();
+        } else {
+            last_error_ = report.error();  // keep the previous report, if any
+        }
+        xSemaphoreGive(mutex_);
+
+        if (!report) {
+            ESP_LOGW(TAG, "Weather fetch failed: %s; retrying in 1 min", report.error().c_str());
+            return kRetryMs;
+        }
+        const char* condition = robot_emo::WmoDescription(report->weather_code);
+        ESP_LOGI(TAG, "Weather: %.1f C, %s (fetched in %lld ms)", report->temperature_c,
+                 condition != nullptr ? condition : "unknown",
+                 static_cast<long long>((esp_timer_get_time() - start_us) / 1000));
+        if (!stack_logged_) {
+            stack_logged_ = true;
+            ESP_LOGI(TAG, "Weather task stack: %u of %lu bytes never used",
+                     static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)),
+                     static_cast<unsigned long>(kStackBytes));
+        }
+        return kRefreshMs;
+    }
+
+    void Run() {
+        while (true) {
+            while (!WifiManager::GetInstance().IsConnected()) {
+                vTaskDelay(pdMS_TO_TICKS(kWifiPollMs));
+            }
+            vTaskDelay(pdMS_TO_TICKS(FetchOnce()));
+        }
+    }
+
+public:
+    WeatherService() {
+        mutex_ = xSemaphoreCreateMutex();
+        if (mutex_ == nullptr) {
+            ESP_LOGE(TAG, "Weather: failed to create mutex; weather disabled");
+        }
+    }
+
+    // Starts the fetch task once. On failure the robot runs without weather.
+    void Start() {
+        if (mutex_ == nullptr || task_ != nullptr) {
+            return;
+        }
+        if (xTaskCreatePinnedToCoreWithCaps(TaskEntry, "weather", kStackBytes, this, 1, &task_,
+                                            tskNO_AFFINITY, MALLOC_CAP_SPIRAM) != pdPASS) {
+            task_ = nullptr;
+            xSemaphoreTake(mutex_, portMAX_DELAY);
+            last_error_ = "weather task could not be created";
+            xSemaphoreGive(mutex_);
+            ESP_LOGE(TAG, "Weather: failed to create task; weather disabled");
+        }
+    }
+
+    // Non-blocking: reads the cache only.
+    ToolResult GetText() {
+        if (mutex_ == nullptr) {
+            return std::unexpected(std::string("Weather is unavailable on this robot"));
+        }
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        const bool has_report = has_report_;
+        const robot_emo::WeatherReport report = report_;
+        const int64_t fetched_us = fetched_us_;
+        const std::string error = last_error_;
+        xSemaphoreGive(mutex_);
+
+        if (!has_report) {
+            return std::unexpected(
+                "Weather not fetched yet" +
+                (error.empty() ? std::string(", waiting for Wi-Fi") : ": " + error) +
+                ". Tell the user the weather is not available yet and to ask again in a minute.");
+        }
+        const int64_t age_s = (esp_timer_get_time() - fetched_us) / 1000000;
+        return robot_emo::FormatWeather(report, kWeatherPlace, age_s);
+    }
+};
+
 // DIAGNOSTIC, REMOVE LATER: wake-word SRAM measurement only.
 // Logs the internal-SRAM low-water mark so wake-word memory cost can be compared with the
 // ~48 KB baseline. Led::OnStateChanged() is the board's only state-change hook. The audio
@@ -755,6 +920,7 @@ class RobotEmoBoard : public WifiBoard {
 private:
     MotorDriver motor_driver_;
     HeartRateSensor heart_rate_sensor_;
+    WeatherService weather_;
     i2c_master_bus_handle_t display_i2c_bus_;
     esp_lcd_panel_io_handle_t panel_io_ = nullptr;
     esp_lcd_panel_handle_t panel_ = nullptr;
@@ -910,6 +1076,24 @@ private:
                 ESP_LOGI(TAG, "MCP self.sensor.get_heart_rate args={} result=%s", text.c_str());
                 return result;
             });
+
+        mcp_server.AddTool(
+            "self.weather.get",
+            "Current weather plus today's and tomorrow's forecast for where the robot is (Thu Duc "
+            "City, Ho Chi Minh City). Use for any question about the weather, temperature, rain "
+            "or tomorrow's weather here. Returns immediately from a cache refreshed every 15 "
+            "minutes; mention it if the data is marked STALE.",
+            PropertyList(), [this](const PropertyList&) -> ToolResult {
+                ToolResult result = weather_.GetText();
+                if (!result) {
+                    ESP_LOGI(TAG, "MCP self.weather.get args={} result=error: %s",
+                             result.error().c_str());
+                    return result;
+                }
+                const std::string& text = std::get<std::string>(*result);
+                ESP_LOGI(TAG, "MCP self.weather.get args={} result=%s", text.c_str());
+                return result;
+            });
     }
 
 public:
@@ -918,6 +1102,7 @@ public:
         InitializeDisplayI2c();
         InitializeSsd1306Display();
         InitializeButtons();
+        weather_.Start();  // waits for Wi-Fi in its own task
     }
 
     virtual void SetNetworkEventCallback(NetworkEventCallback callback) override {

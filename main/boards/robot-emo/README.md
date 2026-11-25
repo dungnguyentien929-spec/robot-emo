@@ -29,6 +29,7 @@ auto-stop uses `esp_timer` without a motor worker task.
 | `self.robot.move` | `direction`: `forward`, `backward`, `left` or `right`; `duration_ms`: 500-5000, default 3000 | Starts the movement and auto-stops after `duration_ms`. Refused while Wi-Fi is disconnected. |
 | `self.robot.stop` | none | Sets all four motor inputs LOW immediately. |
 | `self.sensor.get_heart_rate` | none | Returns immediately with the current BPM. If the current 4-beat window is not steady, it returns the last steady reading from the past 10 s while the finger stays on the sensor. Otherwise it returns "No fresh reading yet ... Beats detected: N/4", asking the user to keep a finger still on the sensor and ask again in about 5 seconds. If the MAX30102 is missing, it retries init (at most once per 2 s) and returns the last initialization error. |
+| `self.weather.get` | none | Returns immediately with the cached current weather and today's and tomorrow's forecast for Thủ Đức City. If no data has been fetched yet, it returns an error saying why. Data older than 2 h is marked STALE. |
 
 The sensor task samples continuously, so the tool never blocks the main event
 loop.
@@ -103,6 +104,38 @@ W (...) RobotEmoBoard: MAX30102 diag: I2C scan 0x08-0x77 ACK: none
 The sensor I2C bus runs at 100 kHz. The LED current is `kLedCurrent` (0x3C,
 about 12 mA) for both LEDs; the ADC range is 16384 nA (`kSpo2Config`, 0x67).
 
+### Weather
+
+`self.weather.get` answers for one fixed place: Thủ Đức City (latitude 10.85,
+longitude 106.77, time zone Asia/Ho_Chi_Minh). The data comes from
+[Open-Meteo](https://open-meteo.com/) over HTTPS, with no account or API key.
+
+- A low-priority `weather` task, with an 8 KB stack in PSRAM, waits for Wi-Fi.
+  It then fetches every 15 minutes, or 1 minute after a failure. A failed
+  fetch keeps the previous data.
+- The tool only reads that cache, so it never waits on the network. The answer
+  includes the current temperature, feels-like temperature, humidity, sky
+  condition, wind and precipitation. It also gives today's and tomorrow's
+  high/low, condition and rain chance, and how long ago the data was fetched.
+  The model says it in Vietnamese.
+- To change the place, edit `kWeatherPlace` and the latitude/longitude in
+  `kWeatherUrl` near the top of `robot_emo_board.cc`, then rebuild.
+- Parsing and the answer text live in `weather_report.{h,cc}`. They have host
+  tests in `scripts/tests/test_robot_emo_weather.py`, which needs a host C++23
+  compiler and is skipped otherwise.
+
+Log lines:
+
+```
+I (...) RobotEmoBoard: Weather: 31.4 C, partly cloudy (fetched in 850 ms)
+I (...) RobotEmoBoard: Weather task stack: 3100 of 8192 bytes never used
+W (...) RobotEmoBoard: Weather fetch failed: connect failed: ...; retrying in 1 min
+I (...) RobotEmoBoard: MCP self.weather.get args={} result=Weather for Thu Duc City, ...
+```
+
+The stack line appears once, after the first successful fetch. Use it to tune
+`kStackBytes`.
+
 ## Build and flash on Windows
 
 From an ESP-IDF PowerShell with ESP-IDF v6.0.3 exported:
@@ -153,6 +186,8 @@ Vietnamese voice tests:
 - “Robot, quay phải trong 1 giây.”
 - “Robot, dừng lại.”
 - “Đo nhịp tim của tôi.”
+- “Thời tiết hôm nay thế nào?”
+- “Mai có mưa không?”
 
 Heart-rate results are reference values only, not medical measurements.
 
