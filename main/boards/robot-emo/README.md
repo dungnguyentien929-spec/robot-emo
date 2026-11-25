@@ -150,58 +150,55 @@ Heart-rate results are reference values only, not medical measurements.
 During startup, click BOOT to enter Wi-Fi provisioning. After startup, click
 BOOT to toggle chat/listening, matching the Bread Compact Wi-Fi behavior.
 
-## Wake word: "alo tí ơi"
+## Wake word
 
-This board replaces the stock WakeNet "Hi ESP" with a MultiNet custom wake
-word (`mn7_cn`). BOOT click still toggles chat as a fallback. ESP-SR has no
-Vietnamese model, so the phrase is approximated with toneless pinyin.
+The default wake word is the stock ESP-SR WakeNet "Hi ESP" (`wn9_hiesp`).
+Say it as English: "hi, E-S-P". A plain build selects it:
 
-Current diagnostic build: eight spellings are registered as separate wake
-commands, so the log shows which one matched (`command_id` 1-8):
+```powershell
+python scripts\build.py robot-emo --name robot-emo --language vi-VN
+```
 
-1. `a lou ti e yi`, 2. `a luo ti ei`, 3. `a lou ti ei`: "alo tí ơi"
-4. `dai ga`, 5. `dai ka`, 6. `da ga`, 7. `da ge`, 8. `dai ge`: two-word alternatives (shorter phrases
-   are easier to match but false-trigger more)
+BOOT click still toggles chat as a fallback. The boot log shows
+`Initialized FD AFE, detector: WakeNet, ...`, and each detection logs
+`Application: Wake word detected: ...`.
 
-The threshold is temporarily 10 (very sensitive) for testing only. Expect more
-false triggers; set it back to about 20 or higher, and keep only the best
-spellings, before normal use.
+### Optional: custom MultiNet wake word (experimental)
 
-It is configured in `config.json`:
+`config.json` also keeps an experimental MultiNet custom wake word
+("alo tí ơi", model `mn7_cn`). It is used only when you opt in:
 
-- `"wake_word": "custom"` makes `scripts/build.py` select
-  `CONFIG_USE_CUSTOM_WAKE_WORD` instead of a WakeNet model. `--wake-word`
-  on the command line still overrides it.
-- `CONFIG_SR_MN_CN_MULTINET7_QUANT=y` packs `mn7_cn` into the assets.
+```powershell
+python scripts\build.py robot-emo --name robot-emo --language vi-VN --wake-word custom
+```
+
+Without `--wake-word custom`, `scripts/build.py` turns the board's MultiNet
+model off, so WakeNet runs and no MultiNet model is packed into the assets.
+
+In testing on this robot, none of the custom Vietnamese spellings triggered,
+even at threshold 10. ESP-SR has no Vietnamese model, so the phrase is only
+approximated with toneless pinyin.
+
+Settings in `config.json` (they take effect only with the opt-in):
+
+- `CONFIG_SR_MN_CN_MULTINET7_QUANT=y` selects the `mn7_cn` model.
 - `CONFIG_CUSTOM_WAKE_WORD` holds the spellings, separated by `|`. Each must be
-  valid toneless pinyin syllables separated by spaces (no Vietnamese letters).
-  Keep the best one or two once you have test results; fewer commands means
-  fewer false triggers.
+  toneless pinyin syllables separated by spaces (no Vietnamese letters). Each
+  spelling becomes its own wake command, numbered from 1 in order. Currently
+  1 `a lou ti e yi`, 2 `a luo ti ei`, 3 `a lou ti ei`, 4 `dai ga`, 5 `dai ka`,
+  6 `da ga`, 7 `da ge`, 8 `dai ge`.
 - `CONFIG_CUSTOM_WAKE_WORD_DISPLAY` is the text sent to the server on wake.
 - `CONFIG_CUSTOM_WAKE_WORD_THRESHOLD` is 1-99 (divided by 100). Lower is more
-  sensitive. Start at 20; raise it if there are false triggers, lower it if
-  real attempts are missed.
+  sensitive. It is currently 10 for testing; use about 20 or higher for normal
+  use.
 
-Rebuild after any change: the build regenerates `index.json` and
-`generated_assets.bin`, and `idf.py flash` writes both the app and the assets
-partition.
-
-Serial log lines to watch:
+Serial log lines for a custom build:
 
 - `CustomWakeWord: Command: <spelling>, Text: alo tí ơi, Action: wake` at boot,
-  one per spelling.
+  one per spelling, and `Initialized FD AFE, detector: MultiNet, ...`.
 - `CustomWakeWord: Custom wake word detected: command_id=N, string=..., prob=...`
-  on every detection. N is the spelling's position (1-8). Only detections at
-  or above the threshold are logged; ESP-SR's MultiNet API documents results
-  only for completed detections, so near misses are not visible. Detections while no
-  one said the phrase are false triggers.
-- `Initialized FD AFE, detector: MultiNet, ...` confirms MultiNet replaced
-  WakeNet; the `After AFE create: free=... min=...` line right after it also
-  shows internal SRAM.
+  on every detection (N is the spelling's number). Only detections at or above
+  the threshold are logged; near misses are not visible through ESP-SR's API.
 - `RobotEmoBoard: Internal SRAM (after audio engine start|20 s after
-  conversation end): min free=... free now=...` to compare with the ~48 KB
-  minimum free internal SRAM seen with WakeNet.
-
-Suggested test: 20 attempts per spelling at about 1 m and 3 m, then 10 minutes
-of TV or conversation nearby with no wake attempts. Count detections per
-`command_id` and false triggers, then adjust the spellings and threshold.
+  conversation end): min free=... free now=...` (a temporary diagnostic) to
+  compare memory use with the WakeNet build.
