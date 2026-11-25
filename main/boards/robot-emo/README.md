@@ -28,74 +28,58 @@ auto-stop uses `esp_timer` without a motor worker task.
 | --- | --- | --- |
 | `self.robot.move` | `direction`: `forward`, `backward`, `left` or `right`; `duration_ms`: 500-5000, default 3000 | Starts the movement and auto-stops after `duration_ms`. Refused while Wi-Fi is disconnected. |
 | `self.robot.stop` | none | Sets all four motor inputs LOW immediately. |
-| `self.sensor.get_heart_rate` | none | Returns immediately with the latest fresh BPM, or "No fresh reading yet ... Beats detected: N/4" asking the user to keep a finger still on the sensor and ask again in about 5 seconds. If the MAX30102 is missing, retries init (at most once per 2 s) and returns the last initialization error. |
+| `self.sensor.get_heart_rate` | none | Returns immediately with the current BPM. If the current 4-beat window is not steady, it returns the last steady reading from the past 10 s while the finger stays on the sensor. Otherwise it returns "No fresh reading yet ... Beats detected: N/4", asking the user to keep a finger still on the sensor and ask again in about 5 seconds. If the MAX30102 is missing, it retries init (at most once per 2 s) and returns the last initialization error. |
 
 The sensor task samples continuously, so the tool never blocks the main event
-loop. Four beat intervals are needed for a BPM value; a reading is stale after
-2.5 s without a beat.
+loop.
 
-### Heart-rate diagnostics
+### Heart-rate measurement
 
-These logs are temporary diagnostics ("DIAGNOSTIC, REMOVE LATER" in
-`robot_emo_board.cc`). They need no tool call.
+**Signal.** A resting finger reads about 62000 IR. The pulse is only about
+100-200 counts (~0.3%). Each heartbeat shows as a sharp drop within ~80 ms,
+followed by a slow rise. With no finger, IR stays far below the finger threshold,
+8000 (`kFingerThreshold`).
 
-**Data path.** Every 2 s, always on:
+**Beat detection.** A beat is counted when the 80 ms slope, after removing slow
+drift, falls below a threshold. The threshold is half the strongest recent
+drop, and at least IR/2000 or 20 counts. A BPM needs four beat intervals that
+agree within 25%. Motion gives irregular intervals, so then there is no current
+reading rather than a wrong number. One missed or extra beat breaks the window
+for a few beats, so the tool falls back to the last steady reading from the
+past 10 s while the finger stays on. A reading is stale after 2.5 s without a
+beat. Removing the finger clears everything.
 
-```
-I (...) RobotEmoBoard: HRALIVE polls=200 data_polls=50 samples=50 recoveries=0 recoveries_total=0 ir=1834 red=1512 ir_raw=00072A red_raw=0005E8 wr=7 rd=7 ovf=0x00 r08=0x4F r09=0x03 r0A=0x27 r0C=0x3C r0D=0x3C id=0x15 i2c_err=0
-```
+**Sensor quirks** (found on this module, kept in the driver):
 
-Expected when the sensor works: about 50 `samples` per 2 s (25/s), `ovf=0x00`
-or small, `ir_raw`/`red_raw` non-zero, the registers as configured, `id=0x15`
-and `i2c_err=0`. `ir` is low (a few thousand) with no finger and rises well
-above 50000 with a finger resting on the sensor.
+- On this sensor, writing 0 to the FIFO pointer registers does **not** empty a
+  full FIFO. It stays full (`FIFO_WR_PTR == FIFO_RD_PTR`, `OVF_COUNTER`
+  climbing), and every new sample is dropped until entries are read from
+  FIFO_DATA. The firmware never clears the FIFO by register writes. When
+  `OVF_COUNTER` is non-zero, it reads and discards all 32 entries. This happens
+  once at boot, because the FIFO starts full of garbage.
+- Real samples have bits 23:18 set (for example IR `3B FF FF`), so the driver
+  keeps only bits 17:0.
+- At the 4096 nA ADC range, a firmly pressed finger saturated IR at 262143. The
+  range is now 16384 nA (`kSpo2Config` = 0x67). If `ir` ever sits at 262143
+  again, lower `kLedCurrent`.
 
-- `samples=0` with `ovf=0x1F` and `wr` equal to `rd` means the FIFO is full
-  and not being read. The firmware now detects this (non-zero overflow
-  counter), drains the stale samples, resets the FIFO and logs
-  `MAX30102 FIFO overflow (ovf=..): drained .. stale samples, cleared FIFO`;
-  `recoveries` counts this. One recovery right after boot is harmless; repeated
-  recoveries mean the sensor task is being starved.
-- `polls`/`data_polls`: FIFO checks in the interval, and how many found data.
-  Each check reads every waiting sample.
-
-The first five raw samples after start-up are logged once to check the byte
-order (3 bytes RED, then 3 bytes IR):
-
-```
-I (...) RobotEmoBoard: HRFIRST 1: 00 05 E8 00 07 2A (red=1512 ir=1834)
-```
-
-**Signal summary.** While the raw IR value is above 10000, the log prints one
-line per second:
+**Logs.** These appear in normal operation:
 
 ```
-I (...) RobotEmoBoard: HRDIAG ir_min=118000 ir_max=119500 baseline=118700 ac_min=-600 ac_max=700 peak_thr=593 samples=25 beats=2/4 finger=1
+I (...) RobotEmoBoard: Heart rate: finger detected (IR 61913)
+I (...) RobotEmoBoard: MCP self.sensor.get_heart_rate args={} result=BPM: 64. This is a reference value, not medical.
+I (...) RobotEmoBoard: Heart rate: finger removed (IR 812)
 ```
 
-- `ir_min`/`ir_max`: raw 18-bit IR range over that second. Near 262143 means
-  the ADC is saturated: lower `kLedCurrent`.
-- `baseline`: slow moving average of IR (0 when no finger is detected).
-- `ac_min`/`ac_max`: IR minus baseline over that second (0 when no finger).
-  The pulse is the swing between them.
-- `peak_thr`: how far above the baseline the signal must rise to count a beat
-  (baseline/200, at least 200). If `ac_max` stays below it, no beats are
-  counted.
-- `samples`: IR samples in that second (about 25 at the current settings).
-- `beats=N/4`: beat intervals collected; a BPM needs 4.
-- `finger`: 1 when IR is above `kFingerThreshold` (50000).
-
-**Raw capture.** With `kHeartRateRawCapture = true`, the first 20 s after a
-finger is placed are also logged as one line per second:
+The following warning prints at most once per 10 s, and only when something
+happened:
 
 ```
-I (...) RobotEmoBoard: HRRAW,1000,118200,118350,...
+W (...) RobotEmoBoard: MAX30102: 1 full-FIFO drains, 0 I2C errors since the last warning
 ```
 
-The first number is the time of that line's first sample in ms since the
-capture started; the rest are the raw IR samples of that second. Copy the
-lines into a spreadsheet to plot the waveform. The capture re-arms after IR
-stays at or below 10000 for 3 s (finger removed).
+One drain right after boot is expected. Repeated drains mean the sensor task
+is being starved.
 
 **Sensor not found.** Init is retried: three attempts at boot about 50 ms
 apart, then at most one attempt per 2 s when `self.sensor.get_heart_rate` is
@@ -117,7 +101,7 @@ W (...) RobotEmoBoard: MAX30102 diag: I2C scan 0x08-0x77 ACK: none
   not a MAX30102.
 
 The sensor I2C bus runs at 100 kHz. The LED current is `kLedCurrent` (0x3C,
-about 12 mA) for both LEDs.
+about 12 mA) for both LEDs; the ADC range is 16384 nA (`kSpo2Config`, 0x67).
 
 ## Build and flash on Windows
 

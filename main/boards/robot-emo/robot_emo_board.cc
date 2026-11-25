@@ -17,6 +17,7 @@
 #include <esp_lcd_panel_vendor.h>
 #include <freertos/semphr.h>
 #include <freertos/task.h>
+#include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <new>
@@ -43,16 +44,15 @@ constexpr gpio_num_t kMotorPins[] = {
 };
 constexpr uint8_t kMax30102Address = 0x57;
 constexpr uint8_t kMax30102PartId = 0x15;
-constexpr uint32_t kFingerThreshold = 50000;
+// MAX30102 SPO2_CONFIG (0x0A): ADC range 16384 nA (bits 6:5 = 11), 100 samples/s, 411 us
+// pulses (18-bit). At the 4096 nA range (0x27) a firmly pressed finger saturated IR at 262143.
+constexpr uint8_t kSpo2Config = 0x67;
+// Finger threshold on raw IR. At 4096 nA, IR was ~800 with no finger, 5000-40000 while the
+// finger was being placed and saturated when pressed; at 16384 nA expect a quarter of that.
+constexpr uint32_t kFingerThreshold = 8000;
 constexpr uint64_t kHeartRateStaleUs = 2500000;
 // MAX30102 LED1 (red) and LED2 (IR) pulse amplitude, registers 0x0C/0x0D: 0.2 mA/LSB, 0x3C = 12 mA.
 constexpr uint8_t kLedCurrent = 0x3C;
-// DIAGNOSTIC, REMOVE LATER: log raw IR samples ("HRRAW,...") for up to 20 s per finger placement.
-constexpr bool kHeartRateRawCapture = true;
-// DIAGNOSTIC, REMOVE LATER: observation build for the MAX30102 FIFO. true: no overflow recovery;
-// log HROBS for 40 polls, then validated one-sample-per-poll reads (HRSAMPLE) and keep that path.
-// false: the batch read with full-FIFO recovery.
-constexpr bool kHrObserve = true;
 
 class MotorDriver {
 private:
@@ -214,12 +214,15 @@ public:
 class HeartRateSensor {
 private:
     static constexpr uint8_t kRegFifoWritePtr = 0x04;
-    static constexpr uint8_t kRegOvfCounter = 0x05;
     static constexpr uint8_t kRegFifoReadPtr = 0x06;
+    static constexpr uint8_t kRegFifoData = 0x07;
     static constexpr size_t kFifoDepth = 32;
     // 0x0A: 100 samples/s; 0x08: 4-sample average -> one FIFO entry every 40 ms.
     static constexpr uint64_t kSamplePeriodUs = 40000;
-    static constexpr uint8_t kRegFifoData = 0x07;
+    // A steady reading stays reportable this long after the last steady 4-interval window,
+    // while the finger stays on the sensor (a single missed or extra beat breaks a window).
+    static constexpr uint64_t kHeldReadingUs = 10000000;
+    static constexpr uint64_t kWarnIntervalUs = 10000000;
 
     i2c_master_bus_handle_t bus_ = nullptr;
     i2c_master_dev_handle_t device_ = nullptr;
@@ -229,64 +232,31 @@ private:
     SemaphoreHandle_t init_mutex_ = nullptr;  // serializes Init() between boot and tool retries
     std::atomic<bool> ready_{false};
     int64_t last_init_attempt_us_ = 0;
-    char scan_line_[112 * 5 + 8] = {};  // DIAGNOSTIC, REMOVE LATER: I2C scan result
+    char scan_line_[112 * 5 + 8] = {};  // I2C scan result after a failed init
 
-    int32_t ir_baseline_ = 0;
-    int32_t previous_ac_ = 0;
+    // Beat detector state (sensor task, under mutex_). See UpdateBeat().
+    int32_t ir_history_[3] = {};  // last three IR samples, oldest first
+    size_t ir_history_count_ = 0;
+    bool trend_ready_ = false;
+    float slope_trend_ = 0;  // slow average of the 80 ms slope (baseline drift)
+    int32_t drop_peak_ = 0;  // strongest recent systolic drop, decays ~2 s
+    int32_t previous_slope_ = 0;
     uint32_t beat_intervals_ms_[4] = {};
     size_t interval_count_ = 0;
     size_t interval_next_ = 0;
     uint64_t last_beat_us_ = 0;
-    int latest_bpm_ = 0;
-    uint32_t last_ir_ = 0;         // guarded by mutex_; reported by the tool
-    uint32_t total_samples_ = 0;   // guarded by mutex_; samples read since the task started
+    int latest_bpm_ = 0;  // 0 unless the last 4 intervals are steady
+    int held_bpm_ = 0;    // last steady reading, cleared when the finger is removed
+    uint64_t held_us_ = 0;
+    bool finger_ = false;
+    uint32_t last_ir_ = 0;        // reported by the tool
+    uint32_t total_samples_ = 0;  // samples read since the task started
 
-    // DIAGNOSTIC, REMOVE LATER: HRALIVE/HROBS/HRSAMPLE state. Sensor task only, no lock.
-    static constexpr uint64_t kAliveIntervalUs = 2000000;
-    static constexpr int kObservePolls = 40;
-    static constexpr uint32_t kObservePollMs = 100;
-    static constexpr int64_t kSampleCheckUs = 5000000;
-    static constexpr int kSampleLogCount = 12;
-    uint64_t alive_start_us_ = 0;
-    uint32_t alive_samples_ = 0;
-    uint32_t alive_i2c_errors_ = 0;
-    uint32_t alive_polls_ = 0;
-    uint32_t alive_data_polls_ = 0;
-    uint32_t alive_invalid_ = 0;     // samples whose RED or IR top byte is above 0x03
-    uint32_t alive_ovf_polls_ = 0;   // polls that read OVF_COUNTER != 0
-    uint8_t alive_ovf_last_ = 0;
-    uint32_t alive_recoveries_ = 0;  // recovery path only (kHrObserve == false)
-    uint32_t recoveries_total_ = 0;
-    uint32_t samples_total_ = 0;
-    uint32_t invalid_total_ = 0;
-    uint8_t alive_raw_[6] = {};  // last FIFO sample as read: RED[0..2], IR[3..5]
-    uint8_t alive_write_ptr_ = 0;
-    uint8_t alive_read_ptr_ = 0;
-    int samples_logged_ = 0;  // HRSAMPLE: first 12 raw samples
-    char alive_line_[384] = {};
-    int64_t init_done_us_ = 0;  // when Init() last configured the sensor and cleared the FIFO
-    uint64_t last_sample_us_ = 0;  // recovery path: keeps batch timestamps strictly increasing
-
-    // DIAGNOSTIC, REMOVE LATER: HRDIAG/HRRAW signal logging. Touched only by the sensor task,
-    // so it needs no lock.
-    static constexpr uint32_t kDiagMinIr = 10000;
-    static constexpr uint64_t kRawCaptureUs = 20000000;
-    static constexpr uint64_t kRawRearmUs = 3000000;
-    static constexpr size_t kRawMaxSamples = 40;  // per 1 s line; the FIFO delivers ~25/s
-    uint64_t diag_window_start_us_ = 0;  // 0: no 1 s window open
-    uint32_t diag_ir_min_ = 0;
-    uint32_t diag_ir_max_ = 0;
-    int32_t diag_ac_min_ = 0;
-    int32_t diag_ac_max_ = 0;
-    bool diag_has_ac_ = false;
-    uint32_t diag_samples_ = 0;
-    bool raw_armed_ = true;
-    uint64_t raw_start_us_ = 0;
-    uint64_t below_since_us_ = 0;
-    uint64_t raw_line_start_us_ = 0;
-    uint32_t raw_samples_[kRawMaxSamples] = {};
-    size_t raw_count_ = 0;
-    char raw_line_[kRawMaxSamples * 8 + 32] = {};
+    // Sensor task only, no lock: rate-limited warnings.
+    uint32_t fifo_full_count_ = 0;
+    uint32_t i2c_error_count_ = 0;
+    uint64_t last_warn_us_ = 0;
+    uint64_t last_sample_us_ = 0;  // keeps batch timestamps strictly increasing
 
     bool ReadRegister(uint8_t reg, uint8_t* data, size_t length) {
         return i2c_master_transmit_receive(device_, &reg, 1, data, length, 100) == ESP_OK;
@@ -297,48 +267,93 @@ private:
         return i2c_master_transmit(device_, buffer, sizeof(buffer), 100) == ESP_OK;
     }
 
-    static void SensorTask(void* arg) {
-        static_cast<HeartRateSensor*>(arg)->Run();
+    static void SensorTask(void* arg) { static_cast<HeartRateSensor*>(arg)->Run(); }
+
+    // This chip sets bits 23:18 on real samples (e.g. IR 3B FF FF), so keep only bits 17:0.
+    static uint32_t Field18(const uint8_t* bytes) {
+        return ((static_cast<uint32_t>(bytes[0]) << 16) | (static_cast<uint32_t>(bytes[1]) << 8) |
+                bytes[2]) &
+               0x3FFFF;
     }
 
+    // Beat detection on the raw IR signal. A resting finger reads ~62000 IR; each heartbeat is
+    // a sharp drop (~100-200 counts within 80 ms, the systolic upstroke absorbing more IR)
+    // followed by a slow rise, so the pulse is ~0.3% of DC. A beat is counted when the
+    // detrended 80 ms slope falls below -threshold, where threshold is half the strongest
+    // recent drop (decaying over ~2 s), at least DC/2000 and 20 counts. A BPM is reported only
+    // when the last 4 intervals agree within 25%; motion and drift give irregular intervals.
     void UpdateBeat(uint32_t ir, uint64_t now_us) {
         const bool finger = ir > kFingerThreshold;
-        int32_t ac = 0;
-        int32_t peak_threshold = 0;
         xSemaphoreTake(mutex_, portMAX_DELAY);
+        const bool finger_changed = finger != finger_;
+        finger_ = finger;
 
         if (!finger) {
-            ir_baseline_ = 0;
-            previous_ac_ = 0;
+            ir_history_count_ = 0;
+            trend_ready_ = false;
+            slope_trend_ = 0;
+            drop_peak_ = 0;
+            previous_slope_ = 0;
             interval_count_ = 0;
             interval_next_ = 0;
             last_beat_us_ = 0;
             latest_bpm_ = 0;
+            held_bpm_ = 0;
+            held_us_ = 0;
         } else {
-            if (ir_baseline_ == 0) {
-                ir_baseline_ = static_cast<int32_t>(ir);
+            ir_history_[0] = ir_history_[1];
+            ir_history_[1] = ir_history_[2];
+            ir_history_[2] = static_cast<int32_t>(ir);
+            if (ir_history_count_ < 3) {
+                ++ir_history_count_;
             }
-            ir_baseline_ += (static_cast<int32_t>(ir) - ir_baseline_) / 32;
-            ac = static_cast<int32_t>(ir) - ir_baseline_;
-            const int32_t threshold = ir_baseline_ / 200;
-            peak_threshold = threshold > 200 ? threshold : 200;
+        }
 
-            if (previous_ac_ <= peak_threshold && ac > peak_threshold &&
+        if (finger && ir_history_count_ == 3) {
+            const int32_t raw_slope = ir_history_[2] - ir_history_[0];
+            if (!trend_ready_) {
+                slope_trend_ = static_cast<float>(raw_slope);  // first slope after placement
+                trend_ready_ = true;
+            }
+            slope_trend_ += (static_cast<float>(raw_slope) - slope_trend_) / 32.0f;
+            const int32_t slope = raw_slope - static_cast<int32_t>(slope_trend_);
+            drop_peak_ -= drop_peak_ / 50;
+            if (-slope > drop_peak_) {
+                drop_peak_ = -slope;
+            }
+            const int32_t floor = std::max<int32_t>(static_cast<int32_t>(ir / 2000), 20);
+            const int32_t drop_threshold = std::max(floor, drop_peak_ / 2);
+
+            if (previous_slope_ > -drop_threshold && slope <= -drop_threshold &&
                 (last_beat_us_ == 0 || now_us - last_beat_us_ >= 300000)) {
                 if (last_beat_us_ != 0) {
                     uint64_t interval_us = now_us - last_beat_us_;
                     if (interval_us >= 300000 && interval_us <= 2000000) {
-                        beat_intervals_ms_[interval_next_] = static_cast<uint32_t>(interval_us / 1000);
+                        beat_intervals_ms_[interval_next_] =
+                            static_cast<uint32_t>(interval_us / 1000);
                         interval_next_ = (interval_next_ + 1) % 4;
                         if (interval_count_ < 4) {
                             ++interval_count_;
                         }
                         if (interval_count_ == 4) {
                             uint64_t total_ms = 0;
+                            uint32_t min_ms = beat_intervals_ms_[0];
+                            uint32_t max_ms = beat_intervals_ms_[0];
                             for (uint32_t interval : beat_intervals_ms_) {
                                 total_ms += interval;
+                                min_ms = std::min(min_ms, interval);
+                                max_ms = std::max(max_ms, interval);
                             }
-                            latest_bpm_ = static_cast<int>((4ULL * 60000 + total_ms / 2) / total_ms);
+                            // Steady rhythm only: the longest interval at most 25% above the
+                            // shortest. Otherwise report nothing rather than a wrong BPM.
+                            latest_bpm_ =
+                                max_ms * 4 <= min_ms * 5
+                                    ? static_cast<int>((4ULL * 60000 + total_ms / 2) / total_ms)
+                                    : 0;
+                            if (latest_bpm_ > 0) {
+                                held_bpm_ = latest_bpm_;
+                                held_us_ = now_us;
+                            }
                         }
                     } else {
                         interval_count_ = 0;
@@ -347,7 +362,7 @@ private:
                 }
                 last_beat_us_ = now_us;
             }
-            previous_ac_ = ac;
+            previous_slope_ = slope;
 
             if (last_beat_us_ != 0 && now_us - last_beat_us_ > kHeartRateStaleUs) {
                 interval_count_ = 0;
@@ -359,279 +374,61 @@ private:
 
         last_ir_ = ir;
         ++total_samples_;
-        const int32_t baseline = ir_baseline_;
-        const size_t beats = interval_count_;
         xSemaphoreGive(mutex_);
-        UpdateDiagnostics(ir, now_us, finger, baseline, ac, peak_threshold, beats);
+        if (finger_changed) {
+            ESP_LOGI(TAG, "Heart rate: finger %s (IR %lu)", finger ? "detected" : "removed",
+                     static_cast<unsigned long>(ir));
+        }
     }
 
-    // DIAGNOSTIC, REMOVE LATER: while IR > 10000, logs one HRDIAG summary line per second and,
-    // if kHeartRateRawCapture, one HRRAW line per second with every IR sample of that second.
-    // HRRAW covers at most 20 s after the finger is first seen; it re-arms after IR stays at
-    // or below 10000 for 3 s. HRRAW's <ms> is the line's first sample, in ms since capture start.
-    void UpdateDiagnostics(uint32_t ir, uint64_t now_us, bool finger, int32_t baseline,
-                           int32_t ac, int32_t peak_threshold, size_t beats) {
-        if (ir <= kDiagMinIr) {
-            diag_window_start_us_ = 0;
-            raw_count_ = 0;
-            if (below_since_us_ == 0) {
-                below_since_us_ = now_us;
-            }
-            if (!raw_armed_ && now_us - below_since_us_ >= kRawRearmUs) {
-                raw_armed_ = true;
-            }
+    void WarnIfNeeded(uint64_t now_us) {
+        if ((fifo_full_count_ == 0 && i2c_error_count_ == 0) ||
+            (last_warn_us_ != 0 && now_us - last_warn_us_ < kWarnIntervalUs)) {
             return;
         }
-        below_since_us_ = 0;
-
-        if (diag_window_start_us_ == 0) {
-            diag_window_start_us_ = now_us;
-            diag_ir_min_ = ir;
-            diag_ir_max_ = ir;
-            diag_has_ac_ = false;
-            diag_samples_ = 0;
-        }
-        diag_ir_min_ = ir < diag_ir_min_ ? ir : diag_ir_min_;
-        diag_ir_max_ = ir > diag_ir_max_ ? ir : diag_ir_max_;
-        if (finger) {
-            if (!diag_has_ac_) {
-                diag_ac_min_ = ac;
-                diag_ac_max_ = ac;
-                diag_has_ac_ = true;
-            }
-            diag_ac_min_ = ac < diag_ac_min_ ? ac : diag_ac_min_;
-            diag_ac_max_ = ac > diag_ac_max_ ? ac : diag_ac_max_;
-        }
-        ++diag_samples_;
-
-        if (kHeartRateRawCapture) {
-            if (raw_armed_) {
-                raw_armed_ = false;
-                raw_start_us_ = now_us;
-                raw_count_ = 0;
-            }
-            if (now_us - raw_start_us_ <= kRawCaptureUs && raw_count_ < kRawMaxSamples) {
-                if (raw_count_ == 0) {
-                    raw_line_start_us_ = now_us;
-                }
-                raw_samples_[raw_count_++] = ir;
-            }
-        }
-
-        if (now_us - diag_window_start_us_ < 1000000) {
-            return;
-        }
-        ESP_LOGI(TAG,
-                 "HRDIAG ir_min=%lu ir_max=%lu baseline=%ld ac_min=%ld ac_max=%ld peak_thr=%ld "
-                 "samples=%lu beats=%u/4 finger=%d",
-                 static_cast<unsigned long>(diag_ir_min_), static_cast<unsigned long>(diag_ir_max_),
-                 static_cast<long>(baseline), static_cast<long>(diag_has_ac_ ? diag_ac_min_ : 0),
-                 static_cast<long>(diag_has_ac_ ? diag_ac_max_ : 0),
-                 static_cast<long>(peak_threshold), static_cast<unsigned long>(diag_samples_),
-                 static_cast<unsigned>(beats), finger ? 1 : 0);
-        diag_window_start_us_ = 0;
-
-        if (raw_count_ > 0) {
-            int len = snprintf(raw_line_, sizeof(raw_line_), "HRRAW,%llu",
-                               static_cast<unsigned long long>(
-                                   (raw_line_start_us_ - raw_start_us_) / 1000));
-            for (size_t i = 0; i < raw_count_ && len > 0 &&
-                               len < static_cast<int>(sizeof(raw_line_));
-                 ++i) {
-                len += snprintf(raw_line_ + len, sizeof(raw_line_) - len, ",%lu",
-                                static_cast<unsigned long>(raw_samples_[i]));
-            }
-            ESP_LOGI(TAG, "%s", raw_line_);
-            raw_count_ = 0;
-        }
+        ESP_LOGW(TAG, "MAX30102: %lu full-FIFO drains, %lu I2C errors since the last warning",
+                 static_cast<unsigned long>(fifo_full_count_),
+                 static_cast<unsigned long>(i2c_error_count_));
+        fifo_full_count_ = 0;
+        i2c_error_count_ = 0;
+        last_warn_us_ = now_us;
     }
 
-    // Resets FIFO_WR_PTR, OVF_COUNTER and FIFO_RD_PTR so the stream restarts from empty.
-    void ClearFifo() {
-        if (!WriteRegister(kRegFifoWritePtr, 0) || !WriteRegister(kRegOvfCounter, 0) ||
-            !WriteRegister(kRegFifoReadPtr, 0)) {
-            ++alive_i2c_errors_;
-        }
-    }
-
-    static uint32_t Field18(const uint8_t* bytes) {
-        return ((static_cast<uint32_t>(bytes[0]) << 16) | (static_cast<uint32_t>(bytes[1]) << 8) |
-                bytes[2]) &
-               0x3FFFF;
-    }
-
-    // 18-bit data leaves bits 23:18 zero, so the first byte of each 3-byte field must be <= 0x03.
-    static bool SampleValid(const uint8_t* sample) {
-        return sample[0] <= 0x03 && sample[3] <= 0x03;
-    }
-
-    // DIAGNOSTIC, REMOVE LATER: counts a sample, keeps its raw bytes for HRALIVE, logs the first
-    // 12 as HRSAMPLE. Returns whether its bytes are valid 18-bit data.
-    bool RecordSample(const uint8_t* sample) {
-        memcpy(alive_raw_, sample, sizeof(alive_raw_));
-        ++alive_samples_;
-        ++samples_total_;
-        const bool valid = SampleValid(sample);
-        if (!valid) {
-            ++alive_invalid_;
-            ++invalid_total_;
-        }
-        if (samples_logged_ < kSampleLogCount) {
-            ++samples_logged_;
-            ESP_LOGI(TAG, "HRSAMPLE i=%d bytes=%02X %02X %02X %02X %02X %02X%s", samples_logged_,
-                     sample[0], sample[1], sample[2], sample[3], sample[4], sample[5],
-                     valid ? "" : " INVALID");
-        }
-        return valid;
-    }
-
-    // Reads FIFO_WR_PTR, OVF_COUNTER and FIFO_RD_PTR with one single-register read each.
-    bool ReadFifoState(uint8_t* write_ptr, uint8_t* overflow, uint8_t* read_ptr) {
-        if (!ReadRegister(kRegFifoWritePtr, write_ptr, 1) ||
-            !ReadRegister(kRegOvfCounter, overflow, 1) ||
-            !ReadRegister(kRegFifoReadPtr, read_ptr, 1)) {
-            ++alive_i2c_errors_;
-            return false;
-        }
-        *write_ptr &= 0x1F;
-        *overflow &= 0x1F;
-        *read_ptr &= 0x1F;
-        return true;
-    }
-
+    // On this sensor, rewriting the FIFO pointer registers does not empty a full FIFO: it stays
+    // full (FIFO_WR_PTR == FIFO_RD_PTR, OVF_COUNTER climbing) and drops every new sample until
+    // entries are read from FIFO_DATA. So the FIFO is never cleared by register writes; a full
+    // FIFO (expected once at boot) is drained by reading all 32 entries.
     void Run() {
-        alive_start_us_ = esp_timer_get_time();
-        if (kHrObserve) {
-            RunObserve();  // never returns
-        }
-        // Init() cleared the FIFO, but this low-priority task may first run seconds later. With
-        // rollover off, 32 entries (1.28 s) fill it, after which FIFO_WR_PTR == FIFO_RD_PTR, so
-        // start from a clean FIFO here. PollFifo() also recovers from any later overflow.
-        ClearFifo();
         while (true) {
             PollFifo();
-            LogAlive();
+            WarnIfNeeded(esp_timer_get_time());
             vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
 
-    // DIAGNOSTIC, REMOVE LATER: observation mode (kHrObserve). Never drains or clears the FIFO
-    // because of an overflow.
-    //  1. HROBS: 40 polls 100 ms apart, logging pointers, OVF_COUNTER and both interrupt status
-    //     registers (single-register reads), plus the same three registers read as one 3-byte
-    //     burst from 0x04, to compare. No samples are read, so the FIFO is seen filling up.
-    //  2. 5 s of one-sample-per-poll reads (only when (wr - rd) & 0x1F != 0), validating every
-    //     sample and logging the first 12 as HRSAMPLE.
-    //  3. Normal operation on that same read path, with HRALIVE every 2 s.
-    // The FIFO is cleared once before step 1 and once before step 2 (phase starts, not
-    // overflow recovery): otherwise both steps would start from the FIFO left full by step 0.
-    void RunObserve() {
-        ESP_LOGI(TAG, "HROBS start: sensor task began %lld ms after Init(); clearing FIFO once",
-                 static_cast<long long>((esp_timer_get_time() - init_done_us_) / 1000));
-        ClearFifo();
-        for (int n = 1; n <= kObservePolls; ++n) {
-            vTaskDelay(pdMS_TO_TICKS(kObservePollMs));
-            uint8_t write_ptr = 0;
-            uint8_t overflow = 0;
-            uint8_t read_ptr = 0;
-            uint8_t int1 = 0;
-            uint8_t int2 = 0;
-            uint8_t burst[3] = {};
-            const bool state_ok = ReadFifoState(&write_ptr, &overflow, &read_ptr);
-            const bool int_ok = ReadRegister(0x00, &int1, 1) && ReadRegister(0x01, &int2, 1);
-            const bool burst_ok = ReadRegister(kRegFifoWritePtr, burst, sizeof(burst));
-            ESP_LOGI(TAG,
-                     "HROBS n=%d wr=%u rd=%u ovf=%u int1=0x%02X int2=0x%02X "
-                     "burst(04,05,06)=%02X/%02X/%02X%s",
-                     n, write_ptr, read_ptr, overflow, int1, int2, burst[0], burst[1], burst[2],
-                     state_ok && int_ok && burst_ok ? "" : " i2c_err");
-        }
-
-        ESP_LOGI(TAG, "HROBS done; clearing FIFO once, then 5 s of validated one-sample reads");
-        ClearFifo();
-        alive_start_us_ = esp_timer_get_time();
-        const int64_t check_end_us = esp_timer_get_time() + kSampleCheckUs;
-        while (esp_timer_get_time() < check_end_us) {
-            PollOneSample();
-            LogAlive();
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-        ESP_LOGI(TAG, "HRSAMPLE check done: %lu invalid of %lu samples in 5 s",
-                 static_cast<unsigned long>(invalid_total_),
-                 static_cast<unsigned long>(samples_total_));
-
-        while (true) {
-            PollOneSample();
-            LogAlive();
-            vTaskDelay(pdMS_TO_TICKS(10));
-        }
-    }
-
-    // Observation read path: at most one sample per poll, no overflow recovery. Invalid samples
-    // are counted and not passed to beat detection.
-    void PollOneSample() {
-        ++alive_polls_;
-        uint8_t write_ptr = 0;
-        uint8_t overflow = 0;
-        uint8_t read_ptr = 0;
-        if (!ReadFifoState(&write_ptr, &overflow, &read_ptr)) {
-            return;
-        }
-        alive_write_ptr_ = write_ptr;
-        alive_read_ptr_ = read_ptr;
-        alive_ovf_last_ = overflow;
-        if (overflow != 0) {
-            ++alive_ovf_polls_;
-        }
-        if (((write_ptr - read_ptr) & 0x1F) == 0) {
-            return;
-        }
-        ++alive_data_polls_;
-        uint8_t sample[6];
-        if (!ReadRegister(kRegFifoData, sample, sizeof(sample))) {
-            ++alive_i2c_errors_;
-            return;
-        }
-        if (!RecordSample(sample)) {
-            return;
-        }
-        UpdateBeat(Field18(sample + 3), esp_timer_get_time());
-    }
-
-    // Recovery read path (kHrObserve == false): reads every available sample. A non-zero
-    // OVF_COUNTER is taken to mean a full FIFO (FIFO_WR_PTR == FIFO_RD_PTR), which is drained and
-    // cleared. Still uses a 3-byte burst read of 0x04-0x06.
+    // Reads every available sample. A non-zero OVF_COUNTER means a full FIFO (FIFO_WR_PTR ==
+    // FIFO_RD_PTR): its 32 stale entries are read and discarded.
     void PollFifo() {
-        ++alive_polls_;
         uint8_t regs[3] = {};  // 0x04 FIFO_WR_PTR, 0x05 OVF_COUNTER, 0x06 FIFO_RD_PTR
         if (!ReadRegister(kRegFifoWritePtr, regs, sizeof(regs))) {
-            ++alive_i2c_errors_;
+            ++i2c_error_count_;
             return;
         }
         const uint8_t write_ptr = regs[0] & 0x1F;
-        const uint8_t overflow = regs[1] & 0x1F;
+        const bool full = (regs[1] & 0x1F) != 0;
         const uint8_t read_ptr = regs[2] & 0x1F;
-        alive_write_ptr_ = write_ptr;
-        alive_read_ptr_ = read_ptr;
-        alive_ovf_last_ = overflow;
-        const bool full = overflow != 0;
-        if (full) {
-            ++alive_ovf_polls_;
-        }
         const size_t available = full ? kFifoDepth : ((write_ptr - read_ptr) & 0x1F);
         if (available == 0) {
             return;
         }
-        ++alive_data_polls_;
 
         const uint64_t now_us = esp_timer_get_time();
         for (size_t i = 0; i < available; ++i) {
-            uint8_t sample[6];
+            uint8_t sample[6];  // RED[0..2], IR[3..5]
             if (!ReadRegister(kRegFifoData, sample, sizeof(sample))) {
-                ++alive_i2c_errors_;
+                ++i2c_error_count_;
                 break;
             }
-            RecordSample(sample);
             if (full) {
                 continue;  // stale entries from before an unknown gap: drained, not analysed
             }
@@ -644,65 +441,9 @@ private:
             last_sample_us_ = sample_us;
             UpdateBeat(Field18(sample + 3), sample_us);
         }
-
         if (full) {
-            ClearFifo();
-            ++alive_recoveries_;
-            ++recoveries_total_;
+            ++fifo_full_count_;
         }
-    }
-
-    // DIAGNOSTIC, REMOVE LATER: every 2 s, one HRALIVE line showing whether samples flow:
-    // polls, polls with data, samples, invalid samples, polls that saw an overflow, recoveries,
-    // the last RED/IR (masked and raw 3-byte fields), FIFO pointers, registers read back and
-    // I2C errors in the interval.
-    void LogAlive() {
-        const uint64_t now_us = esp_timer_get_time();
-        if (now_us - alive_start_us_ < kAliveIntervalUs) {
-            return;
-        }
-        static constexpr uint8_t kRegs[] = {0x05, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0xFF};
-        static constexpr const char* kNames[] = {"ovf", "r08", "r09", "r0A", "r0C", "r0D", "id"};
-        int len = snprintf(alive_line_, sizeof(alive_line_),
-                           "HRALIVE polls=%lu data_polls=%lu samples=%lu invalid=%lu "
-                           "ovf_polls=%lu ovf_last=%u recoveries=%lu recoveries_total=%lu "
-                           "ir=%lu red=%lu ir_raw=%02X%02X%02X red_raw=%02X%02X%02X wr=%u rd=%u",
-                           static_cast<unsigned long>(alive_polls_),
-                           static_cast<unsigned long>(alive_data_polls_),
-                           static_cast<unsigned long>(alive_samples_),
-                           static_cast<unsigned long>(alive_invalid_),
-                           static_cast<unsigned long>(alive_ovf_polls_), alive_ovf_last_,
-                           static_cast<unsigned long>(alive_recoveries_),
-                           static_cast<unsigned long>(recoveries_total_),
-                           static_cast<unsigned long>(Field18(alive_raw_ + 3)),
-                           static_cast<unsigned long>(Field18(alive_raw_)), alive_raw_[3],
-                           alive_raw_[4], alive_raw_[5], alive_raw_[0], alive_raw_[1],
-                           alive_raw_[2], alive_write_ptr_, alive_read_ptr_);
-        for (size_t i = 0; i < sizeof(kRegs) && len > 0 && len < static_cast<int>(sizeof(alive_line_));
-             ++i) {
-            uint8_t value = 0;
-            if (ReadRegister(kRegs[i], &value, 1)) {
-                len += snprintf(alive_line_ + len, sizeof(alive_line_) - len, " %s=0x%02X",
-                                kNames[i], value);
-            } else {
-                ++alive_i2c_errors_;
-                len += snprintf(alive_line_ + len, sizeof(alive_line_) - len, " %s=ERR",
-                                kNames[i]);
-            }
-        }
-        if (len > 0 && len < static_cast<int>(sizeof(alive_line_))) {
-            snprintf(alive_line_ + len, sizeof(alive_line_) - len, " i2c_err=%lu",
-                     static_cast<unsigned long>(alive_i2c_errors_));
-        }
-        ESP_LOGI(TAG, "%s", alive_line_);
-        alive_start_us_ = now_us;
-        alive_samples_ = 0;
-        alive_i2c_errors_ = 0;
-        alive_polls_ = 0;
-        alive_data_polls_ = 0;
-        alive_invalid_ = 0;
-        alive_ovf_polls_ = 0;
-        alive_recoveries_ = 0;
     }
 
     static constexpr gpio_num_t kSdaPin = GPIO_NUM_8;
@@ -724,7 +465,7 @@ private:
         }
     }
 
-    // DIAGNOSTIC, REMOVE LATER: line levels and an address scan after a failed init attempt.
+    // After a failed init attempt: line levels and an address scan, to tell wiring faults apart.
     void LogBusDiagnostics() {
         int sda = 0;
         int scl = 0;
@@ -746,7 +487,8 @@ private:
             gpio_reset_pin(kSdaPin);
             gpio_reset_pin(kSclPin);
         }
-        ESP_LOGW(TAG, "MAX30102 diag: SDA(GPIO8)=%d SCL(GPIO9)=%d with internal pull-ups", sda, scl);
+        ESP_LOGW(TAG, "MAX30102 diag: SDA(GPIO8)=%d SCL(GPIO9)=%d with internal pull-ups", sda,
+                 scl);
         if (bus_ == nullptr) {
             ESP_LOGW(TAG, "MAX30102 diag: I2C scan skipped, bus was not created");
             return;
@@ -782,8 +524,8 @@ private:
         esp_err_t err = i2c_new_master_bus(&bus_config, &bus_);
         if (err != ESP_OK) {
             bus_ = nullptr;
-            init_error_ = "Failed to initialize MAX30102 I2C bus 2: " +
-                          std::string(esp_err_to_name(err));
+            init_error_ =
+                "Failed to initialize MAX30102 I2C bus 2: " + std::string(esp_err_to_name(err));
             return false;
         }
 
@@ -812,7 +554,7 @@ private:
             return false;
         }
         if (part_id != kMax30102PartId) {
-            // DIAGNOSTIC, REMOVE LATER: something ACKs at 0x57 but is not a MAX30102.
+            // Something ACKs at 0x57 but is not a MAX30102.
             ESP_LOGW(TAG, "MAX30102 diag: device at 0x57 has part ID 0x%02X, expected 0x%02X",
                      part_id, kMax30102PartId);
             char message[80];
@@ -844,7 +586,7 @@ private:
             return false;
         }
         if (!WriteRegister(0x08, 0x4F) || !WriteRegister(0x09, 0x03) ||
-            !WriteRegister(0x0A, 0x27) || !WriteRegister(0x0C, kLedCurrent) ||
+            !WriteRegister(0x0A, kSpo2Config) || !WriteRegister(0x0C, kLedCurrent) ||
             !WriteRegister(0x0D, kLedCurrent) || !WriteRegister(kRegFifoWritePtr, 0) ||
             !WriteRegister(0x05, 0) || !WriteRegister(kRegFifoReadPtr, 0)) {
             init_error_ = "Failed to configure MAX30102";
@@ -862,7 +604,6 @@ private:
             ReleaseI2c();
             return false;
         }
-        init_done_us_ = esp_timer_get_time();  // set before the sensor task can read it
         if (task_ == nullptr &&
             xTaskCreate(SensorTask, "heart_rate", kTaskStackBytes, this, 1, &task_) != pdPASS) {
             task_ = nullptr;
@@ -872,8 +613,9 @@ private:
         }
         init_error_.clear();
         ready_ = true;
-        ESP_LOGI(TAG, "MAX30102 found at 0x57 (I2C %lu Hz); sensor task stack=%lu bytes, priority=1",
-                 static_cast<unsigned long>(kI2cSpeedHz), static_cast<unsigned long>(kTaskStackBytes));
+        ESP_LOGI(
+            TAG, "MAX30102 found at 0x57 (I2C %lu Hz); sensor task stack=%lu bytes, priority=1",
+            static_cast<unsigned long>(kI2cSpeedHz), static_cast<unsigned long>(kTaskStackBytes));
         return true;
     }
 
@@ -899,7 +641,8 @@ public:
             }
         }
         if (!ready_) {
-            ESP_LOGE(TAG, "MAX30102 unavailable after %d attempts (%lld ms); the tool retries later",
+            ESP_LOGE(TAG,
+                     "MAX30102 unavailable after %d attempts (%lld ms); the tool retries later",
                      kBootInitAttempts, (esp_timer_get_time() - start_us) / 1000);
         }
         xSemaphoreGive(init_mutex_);
@@ -913,8 +656,8 @@ public:
                 return std::unexpected(init_error_);
             }
             if (xSemaphoreTake(init_mutex_, 0) != pdTRUE) {
-                return std::unexpected(
-                    std::string("Heart-rate sensor initialization is in progress; ask again shortly."));
+                return std::unexpected(std::string(
+                    "Heart-rate sensor initialization is in progress; ask again shortly."));
             }
             if (!ready_ && esp_timer_get_time() - last_init_attempt_us_ >= kInitRetryUs) {
                 if (!Init()) {
@@ -933,18 +676,23 @@ public:
 
         const uint64_t now_us = esp_timer_get_time();
         xSemaphoreTake(mutex_, portMAX_DELAY);
-        const bool fresh = latest_bpm_ > 0 && last_beat_us_ != 0 &&
-                           now_us - last_beat_us_ <= kHeartRateStaleUs;
+        const bool fresh =
+            latest_bpm_ > 0 && last_beat_us_ != 0 && now_us - last_beat_us_ <= kHeartRateStaleUs;
         const int bpm = latest_bpm_;
+        // A missed or extra beat breaks the 4-interval window for a few seconds; while the
+        // finger stays on, the last steady reading is still a valid answer for 10 s.
+        const bool held = !fresh && finger_ && held_bpm_ > 0 && now_us - held_us_ <= kHeldReadingUs;
+        const int held_bpm = held_bpm_;
         const size_t beats = interval_count_;
         const uint32_t last_ir = last_ir_;
         const uint32_t samples = total_samples_;
         xSemaphoreGive(mutex_);
 
-        if (fresh) {
-            return "BPM: " + std::to_string(bpm) + ". This is a reference value, not medical.";
+        if (fresh || held) {
+            return "BPM: " + std::to_string(fresh ? bpm : held_bpm) +
+                   ". This is a reference value, not medical.";
         }
-        const char* finger_state = samples == 0              ? "no sensor data yet"
+        const char* finger_state = samples == 0                 ? "no sensor data yet"
                                    : last_ir > kFingerThreshold ? "finger detected"
                                                                 : "no finger detected";
         return "No fresh reading yet (" + std::string(finger_state) + "; last IR " +
