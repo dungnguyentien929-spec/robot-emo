@@ -56,8 +56,8 @@ constexpr uint64_t kHeartRateStaleUs = 2500000;
 // MAX30102 LED1 (red) and LED2 (IR) pulse amplitude, registers 0x0C/0x0D: 0.2 mA/LSB, 0x3C = 12 mA.
 constexpr uint8_t kLedCurrent = 0x3C;
 
-// Weather place for self.weather.get. To change it, edit these three and the URL's
-// latitude/longitude, then rebuild.
+// Weather place for self.weather.get. To change it, edit kWeatherPlace and, in kWeatherUrl,
+// latitude, longitude and (outside Vietnam) timezone, then rebuild.
 constexpr const char* kWeatherPlace = "Thu Duc City, Ho Chi Minh City, Vietnam";
 constexpr const char* kWeatherUrl =
     "https://api.open-meteo.com/v1/forecast?latitude=10.85&longitude=106.77"
@@ -859,9 +859,13 @@ public:
         xSemaphoreGive(mutex_);
 
         if (!has_report) {
+            // No error yet: either Wi-Fi is down, or it is up and the first fetch is running.
+            const std::string reason = !error.empty() ? ": " + error
+                                       : WifiManager::GetInstance().IsConnected()
+                                           ? std::string(", the first fetch is in progress")
+                                           : std::string(", waiting for Wi-Fi");
             return std::unexpected(
-                "Weather not fetched yet" +
-                (error.empty() ? std::string(", waiting for Wi-Fi") : ": " + error) +
+                "Weather not fetched yet" + reason +
                 ". Tell the user the weather is not available yet and to ask again in a minute.");
         }
         const int64_t age_s = (esp_timer_get_time() - fetched_us) / 1000000;

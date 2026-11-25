@@ -120,8 +120,12 @@ longitude 106.77, time zone Asia/Ho_Chi_Minh). The data comes from
   ago the data was fetched. The dates let the model notice when a day has
   rolled over since the last fetch.
   The model says it in Vietnamese.
-- To change the place, edit `kWeatherPlace` and the latitude/longitude in
-  `kWeatherUrl` near the top of `robot_emo_board.cc`, then rebuild.
+- To change the place, edit `kWeatherPlace`, then the latitude and longitude
+  in `kWeatherUrl` near the top of `robot_emo_board.cc`, and rebuild. Outside
+  Vietnam, also change the URL's `timezone`, which sets where "today" starts.
+- A fetch cannot hang: esp-tls gives the socket a 10 s send/receive timeout
+  even though the HTTP client sets none for the TLS handshake. A stalled
+  connection fails and is retried a minute later.
 - Parsing and the answer text live in `weather_report.{h,cc}`. They have host
   tests in `scripts/tests/test_robot_emo_weather.py`, which needs a host C++23
   compiler and is skipped otherwise.
