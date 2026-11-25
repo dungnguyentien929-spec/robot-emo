@@ -251,6 +251,6 @@ Serial log lines for a custom build:
 - `CustomWakeWord: Custom wake word detected: command_id=N, string=..., prob=...`
   on every detection (N is the spelling's number). Only detections at or above
   the threshold are logged; near misses are not visible through ESP-SR's API.
-- `RobotEmoBoard: Internal SRAM (after audio engine start|20 s after
-  conversation end): min free=... free now=...` (a temporary diagnostic) to
-  compare memory use with the WakeNet build.
+
+To compare memory use with the WakeNet build, use the periodic
+`SystemInfo: free sram: ... minimal sram: ...` line.

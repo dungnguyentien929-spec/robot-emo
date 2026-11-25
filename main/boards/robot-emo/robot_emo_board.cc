@@ -11,7 +11,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <esp_rom_sys.h>
-#include <esp_heap_caps.h>  // DIAGNOSTIC, REMOVE LATER (SRAM log)
+#include <esp_heap_caps.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
 #include <esp_lcd_panel_ops.h>
@@ -873,51 +873,6 @@ public:
     }
 };
 
-// DIAGNOSTIC, REMOVE LATER: wake-word SRAM measurement only.
-// Logs the internal-SRAM low-water mark so wake-word memory cost can be compared with the
-// ~48 KB baseline. Led::OnStateChanged() is the board's only state-change hook. The audio
-// engine starts on the first switch to idle, so the first report fires 5 s later; each later
-// idle (end of a conversation) reports again after 20 s.
-class MemoryReportingLed : public SingleLed {
-private:
-    esp_timer_handle_t timer_ = nullptr;
-    std::atomic<bool> engine_reported_{false};  // written by esp_timer, read on main task
-
-    static void Report(void* arg) {
-        auto* self = static_cast<MemoryReportingLed*>(arg);
-        ESP_LOGI(TAG, "Internal SRAM (%s): min free=%u bytes, free now=%u bytes",
-                 self->engine_reported_ ? "20 s after conversation end" : "after audio engine start",
-                 static_cast<unsigned>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
-                 static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)));
-        self->engine_reported_ = true;
-    }
-
-public:
-    explicit MemoryReportingLed(gpio_num_t gpio) : SingleLed(gpio) {
-        esp_timer_create_args_t args = {
-            .callback = Report,
-            .arg = this,
-            .dispatch_method = ESP_TIMER_TASK,
-            .name = "robot_sram_log",
-            .skip_unhandled_events = true,
-        };
-        if (esp_timer_create(&args, &timer_) != ESP_OK) {
-            timer_ = nullptr;
-        }
-    }
-
-    void OnStateChanged() override {
-        SingleLed::OnStateChanged();
-        if (timer_ == nullptr) {
-            return;
-        }
-        esp_timer_stop(timer_);
-        if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
-            esp_timer_start_once(timer_, engine_reported_ ? 20000000 : 5000000);
-        }
-    }
-};  // DIAGNOSTIC, REMOVE LATER: end of MemoryReportingLed
-
 }  // namespace
 
 class RobotEmoBoard : public WifiBoard {
@@ -1123,8 +1078,7 @@ public:
     }
 
     virtual Led* GetLed() override {
-        // DIAGNOSTIC, REMOVE LATER: restore `static SingleLed led(BUILTIN_LED_GPIO);`.
-        static MemoryReportingLed led(BUILTIN_LED_GPIO);
+        static SingleLed led(BUILTIN_LED_GPIO);
         return &led;
     }
 
