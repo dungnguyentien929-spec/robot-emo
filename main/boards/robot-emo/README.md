@@ -39,6 +39,33 @@ loop. Four beat intervals are needed for a BPM value; a reading is stale after
 These logs are temporary diagnostics ("DIAGNOSTIC, REMOVE LATER" in
 `robot_emo_board.cc`). They need no tool call.
 
+**Data path.** Every 2 s, always on:
+
+```
+I (...) RobotEmoBoard: HRALIVE polls=200 data_polls=50 samples=50 recoveries=0 recoveries_total=0 ir=1834 red=1512 ir_raw=00072A red_raw=0005E8 wr=7 rd=7 ovf=0x00 r08=0x4F r09=0x03 r0A=0x27 r0C=0x3C r0D=0x3C id=0x15 i2c_err=0
+```
+
+Expected when the sensor works: about 50 `samples` per 2 s (25/s), `ovf=0x00`
+or small, `ir_raw`/`red_raw` non-zero, the registers as configured, `id=0x15`
+and `i2c_err=0`. `ir` is low (a few thousand) with no finger and rises well
+above 50000 with a finger resting on the sensor.
+
+- `samples=0` with `ovf=0x1F` and `wr` equal to `rd` means the FIFO is full
+  and not being read. The firmware now detects this (non-zero overflow
+  counter), drains the stale samples, resets the FIFO and logs
+  `MAX30102 FIFO overflow (ovf=..): drained .. stale samples, cleared FIFO`;
+  `recoveries` counts this. One recovery right after boot is harmless; repeated
+  recoveries mean the sensor task is being starved.
+- `polls`/`data_polls`: FIFO checks in the interval, and how many found data.
+  Each check reads every waiting sample.
+
+The first five raw samples after start-up are logged once to check the byte
+order (3 bytes RED, then 3 bytes IR):
+
+```
+I (...) RobotEmoBoard: HRFIRST 1: 00 05 E8 00 07 2A (red=1512 ir=1834)
+```
+
 **Signal summary.** While the raw IR value is above 10000, the log prints one
 line per second:
 

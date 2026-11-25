@@ -18,6 +18,7 @@
 #include <freertos/semphr.h>
 #include <freertos/task.h>
 #include <atomic>
+#include <cstring>
 #include <new>
 #include <string>
 #include <utility>
@@ -48,6 +49,10 @@ constexpr uint64_t kHeartRateStaleUs = 2500000;
 constexpr uint8_t kLedCurrent = 0x3C;
 // DIAGNOSTIC, REMOVE LATER: log raw IR samples ("HRRAW,...") for up to 20 s per finger placement.
 constexpr bool kHeartRateRawCapture = true;
+// DIAGNOSTIC, REMOVE LATER: observation build for the MAX30102 FIFO. true: no overflow recovery;
+// log HROBS for 40 polls, then validated one-sample-per-poll reads (HRSAMPLE) and keep that path.
+// false: the batch read with full-FIFO recovery.
+constexpr bool kHrObserve = true;
 
 class MotorDriver {
 private:
@@ -209,7 +214,11 @@ public:
 class HeartRateSensor {
 private:
     static constexpr uint8_t kRegFifoWritePtr = 0x04;
+    static constexpr uint8_t kRegOvfCounter = 0x05;
     static constexpr uint8_t kRegFifoReadPtr = 0x06;
+    static constexpr size_t kFifoDepth = 32;
+    // 0x0A: 100 samples/s; 0x08: 4-sample average -> one FIFO entry every 40 ms.
+    static constexpr uint64_t kSamplePeriodUs = 40000;
     static constexpr uint8_t kRegFifoData = 0x07;
 
     i2c_master_bus_handle_t bus_ = nullptr;
@@ -229,6 +238,34 @@ private:
     size_t interval_next_ = 0;
     uint64_t last_beat_us_ = 0;
     int latest_bpm_ = 0;
+    uint32_t last_ir_ = 0;         // guarded by mutex_; reported by the tool
+    uint32_t total_samples_ = 0;   // guarded by mutex_; samples read since the task started
+
+    // DIAGNOSTIC, REMOVE LATER: HRALIVE/HROBS/HRSAMPLE state. Sensor task only, no lock.
+    static constexpr uint64_t kAliveIntervalUs = 2000000;
+    static constexpr int kObservePolls = 40;
+    static constexpr uint32_t kObservePollMs = 100;
+    static constexpr int64_t kSampleCheckUs = 5000000;
+    static constexpr int kSampleLogCount = 12;
+    uint64_t alive_start_us_ = 0;
+    uint32_t alive_samples_ = 0;
+    uint32_t alive_i2c_errors_ = 0;
+    uint32_t alive_polls_ = 0;
+    uint32_t alive_data_polls_ = 0;
+    uint32_t alive_invalid_ = 0;     // samples whose RED or IR top byte is above 0x03
+    uint32_t alive_ovf_polls_ = 0;   // polls that read OVF_COUNTER != 0
+    uint8_t alive_ovf_last_ = 0;
+    uint32_t alive_recoveries_ = 0;  // recovery path only (kHrObserve == false)
+    uint32_t recoveries_total_ = 0;
+    uint32_t samples_total_ = 0;
+    uint32_t invalid_total_ = 0;
+    uint8_t alive_raw_[6] = {};  // last FIFO sample as read: RED[0..2], IR[3..5]
+    uint8_t alive_write_ptr_ = 0;
+    uint8_t alive_read_ptr_ = 0;
+    int samples_logged_ = 0;  // HRSAMPLE: first 12 raw samples
+    char alive_line_[384] = {};
+    int64_t init_done_us_ = 0;  // when Init() last configured the sensor and cleared the FIFO
+    uint64_t last_sample_us_ = 0;  // recovery path: keeps batch timestamps strictly increasing
 
     // DIAGNOSTIC, REMOVE LATER: HRDIAG/HRRAW signal logging. Touched only by the sensor task,
     // so it needs no lock.
@@ -320,6 +357,8 @@ private:
             }
         }
 
+        last_ir_ = ir;
+        ++total_samples_;
         const int32_t baseline = ir_baseline_;
         const size_t beats = interval_count_;
         xSemaphoreGive(mutex_);
@@ -407,23 +446,263 @@ private:
         }
     }
 
+    // Resets FIFO_WR_PTR, OVF_COUNTER and FIFO_RD_PTR so the stream restarts from empty.
+    void ClearFifo() {
+        if (!WriteRegister(kRegFifoWritePtr, 0) || !WriteRegister(kRegOvfCounter, 0) ||
+            !WriteRegister(kRegFifoReadPtr, 0)) {
+            ++alive_i2c_errors_;
+        }
+    }
+
+    static uint32_t Field18(const uint8_t* bytes) {
+        return ((static_cast<uint32_t>(bytes[0]) << 16) | (static_cast<uint32_t>(bytes[1]) << 8) |
+                bytes[2]) &
+               0x3FFFF;
+    }
+
+    // 18-bit data leaves bits 23:18 zero, so the first byte of each 3-byte field must be <= 0x03.
+    static bool SampleValid(const uint8_t* sample) {
+        return sample[0] <= 0x03 && sample[3] <= 0x03;
+    }
+
+    // DIAGNOSTIC, REMOVE LATER: counts a sample, keeps its raw bytes for HRALIVE, logs the first
+    // 12 as HRSAMPLE. Returns whether its bytes are valid 18-bit data.
+    bool RecordSample(const uint8_t* sample) {
+        memcpy(alive_raw_, sample, sizeof(alive_raw_));
+        ++alive_samples_;
+        ++samples_total_;
+        const bool valid = SampleValid(sample);
+        if (!valid) {
+            ++alive_invalid_;
+            ++invalid_total_;
+        }
+        if (samples_logged_ < kSampleLogCount) {
+            ++samples_logged_;
+            ESP_LOGI(TAG, "HRSAMPLE i=%d bytes=%02X %02X %02X %02X %02X %02X%s", samples_logged_,
+                     sample[0], sample[1], sample[2], sample[3], sample[4], sample[5],
+                     valid ? "" : " INVALID");
+        }
+        return valid;
+    }
+
+    // Reads FIFO_WR_PTR, OVF_COUNTER and FIFO_RD_PTR with one single-register read each.
+    bool ReadFifoState(uint8_t* write_ptr, uint8_t* overflow, uint8_t* read_ptr) {
+        if (!ReadRegister(kRegFifoWritePtr, write_ptr, 1) ||
+            !ReadRegister(kRegOvfCounter, overflow, 1) ||
+            !ReadRegister(kRegFifoReadPtr, read_ptr, 1)) {
+            ++alive_i2c_errors_;
+            return false;
+        }
+        *write_ptr &= 0x1F;
+        *overflow &= 0x1F;
+        *read_ptr &= 0x1F;
+        return true;
+    }
+
     void Run() {
+        alive_start_us_ = esp_timer_get_time();
+        if (kHrObserve) {
+            RunObserve();  // never returns
+        }
+        // Init() cleared the FIFO, but this low-priority task may first run seconds later. With
+        // rollover off, 32 entries (1.28 s) fill it, after which FIFO_WR_PTR == FIFO_RD_PTR, so
+        // start from a clean FIFO here. PollFifo() also recovers from any later overflow.
+        ClearFifo();
         while (true) {
-            uint8_t write_ptr = 0;
-            uint8_t read_ptr = 0;
-            if (ReadRegister(kRegFifoWritePtr, &write_ptr, 1) &&
-                ReadRegister(kRegFifoReadPtr, &read_ptr, 1) &&
-                ((write_ptr - read_ptr) & 0x1F) != 0) {
-                uint8_t sample[6];
-                if (ReadRegister(kRegFifoData, sample, sizeof(sample))) {
-                    uint32_t ir = ((static_cast<uint32_t>(sample[3]) << 16) |
-                                   (static_cast<uint32_t>(sample[4]) << 8) | sample[5]) &
-                                  0x3FFFF;
-                    UpdateBeat(ir, esp_timer_get_time());
-                }
-            }
+            PollFifo();
+            LogAlive();
             vTaskDelay(pdMS_TO_TICKS(10));
         }
+    }
+
+    // DIAGNOSTIC, REMOVE LATER: observation mode (kHrObserve). Never drains or clears the FIFO
+    // because of an overflow.
+    //  1. HROBS: 40 polls 100 ms apart, logging pointers, OVF_COUNTER and both interrupt status
+    //     registers (single-register reads), plus the same three registers read as one 3-byte
+    //     burst from 0x04, to compare. No samples are read, so the FIFO is seen filling up.
+    //  2. 5 s of one-sample-per-poll reads (only when (wr - rd) & 0x1F != 0), validating every
+    //     sample and logging the first 12 as HRSAMPLE.
+    //  3. Normal operation on that same read path, with HRALIVE every 2 s.
+    // The FIFO is cleared once before step 1 and once before step 2 (phase starts, not
+    // overflow recovery): otherwise both steps would start from the FIFO left full by step 0.
+    void RunObserve() {
+        ESP_LOGI(TAG, "HROBS start: sensor task began %lld ms after Init(); clearing FIFO once",
+                 static_cast<long long>((esp_timer_get_time() - init_done_us_) / 1000));
+        ClearFifo();
+        for (int n = 1; n <= kObservePolls; ++n) {
+            vTaskDelay(pdMS_TO_TICKS(kObservePollMs));
+            uint8_t write_ptr = 0;
+            uint8_t overflow = 0;
+            uint8_t read_ptr = 0;
+            uint8_t int1 = 0;
+            uint8_t int2 = 0;
+            uint8_t burst[3] = {};
+            const bool state_ok = ReadFifoState(&write_ptr, &overflow, &read_ptr);
+            const bool int_ok = ReadRegister(0x00, &int1, 1) && ReadRegister(0x01, &int2, 1);
+            const bool burst_ok = ReadRegister(kRegFifoWritePtr, burst, sizeof(burst));
+            ESP_LOGI(TAG,
+                     "HROBS n=%d wr=%u rd=%u ovf=%u int1=0x%02X int2=0x%02X "
+                     "burst(04,05,06)=%02X/%02X/%02X%s",
+                     n, write_ptr, read_ptr, overflow, int1, int2, burst[0], burst[1], burst[2],
+                     state_ok && int_ok && burst_ok ? "" : " i2c_err");
+        }
+
+        ESP_LOGI(TAG, "HROBS done; clearing FIFO once, then 5 s of validated one-sample reads");
+        ClearFifo();
+        alive_start_us_ = esp_timer_get_time();
+        const int64_t check_end_us = esp_timer_get_time() + kSampleCheckUs;
+        while (esp_timer_get_time() < check_end_us) {
+            PollOneSample();
+            LogAlive();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        ESP_LOGI(TAG, "HRSAMPLE check done: %lu invalid of %lu samples in 5 s",
+                 static_cast<unsigned long>(invalid_total_),
+                 static_cast<unsigned long>(samples_total_));
+
+        while (true) {
+            PollOneSample();
+            LogAlive();
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+    }
+
+    // Observation read path: at most one sample per poll, no overflow recovery. Invalid samples
+    // are counted and not passed to beat detection.
+    void PollOneSample() {
+        ++alive_polls_;
+        uint8_t write_ptr = 0;
+        uint8_t overflow = 0;
+        uint8_t read_ptr = 0;
+        if (!ReadFifoState(&write_ptr, &overflow, &read_ptr)) {
+            return;
+        }
+        alive_write_ptr_ = write_ptr;
+        alive_read_ptr_ = read_ptr;
+        alive_ovf_last_ = overflow;
+        if (overflow != 0) {
+            ++alive_ovf_polls_;
+        }
+        if (((write_ptr - read_ptr) & 0x1F) == 0) {
+            return;
+        }
+        ++alive_data_polls_;
+        uint8_t sample[6];
+        if (!ReadRegister(kRegFifoData, sample, sizeof(sample))) {
+            ++alive_i2c_errors_;
+            return;
+        }
+        if (!RecordSample(sample)) {
+            return;
+        }
+        UpdateBeat(Field18(sample + 3), esp_timer_get_time());
+    }
+
+    // Recovery read path (kHrObserve == false): reads every available sample. A non-zero
+    // OVF_COUNTER is taken to mean a full FIFO (FIFO_WR_PTR == FIFO_RD_PTR), which is drained and
+    // cleared. Still uses a 3-byte burst read of 0x04-0x06.
+    void PollFifo() {
+        ++alive_polls_;
+        uint8_t regs[3] = {};  // 0x04 FIFO_WR_PTR, 0x05 OVF_COUNTER, 0x06 FIFO_RD_PTR
+        if (!ReadRegister(kRegFifoWritePtr, regs, sizeof(regs))) {
+            ++alive_i2c_errors_;
+            return;
+        }
+        const uint8_t write_ptr = regs[0] & 0x1F;
+        const uint8_t overflow = regs[1] & 0x1F;
+        const uint8_t read_ptr = regs[2] & 0x1F;
+        alive_write_ptr_ = write_ptr;
+        alive_read_ptr_ = read_ptr;
+        alive_ovf_last_ = overflow;
+        const bool full = overflow != 0;
+        if (full) {
+            ++alive_ovf_polls_;
+        }
+        const size_t available = full ? kFifoDepth : ((write_ptr - read_ptr) & 0x1F);
+        if (available == 0) {
+            return;
+        }
+        ++alive_data_polls_;
+
+        const uint64_t now_us = esp_timer_get_time();
+        for (size_t i = 0; i < available; ++i) {
+            uint8_t sample[6];
+            if (!ReadRegister(kRegFifoData, sample, sizeof(sample))) {
+                ++alive_i2c_errors_;
+                break;
+            }
+            RecordSample(sample);
+            if (full) {
+                continue;  // stale entries from before an unknown gap: drained, not analysed
+            }
+            // Entries are 40 ms apart and the newest was just written; stamp each one so a
+            // batch read does not collapse several samples onto one timestamp.
+            uint64_t sample_us = now_us - (available - 1 - i) * kSamplePeriodUs;
+            if (sample_us <= last_sample_us_) {
+                sample_us = last_sample_us_ + 1;
+            }
+            last_sample_us_ = sample_us;
+            UpdateBeat(Field18(sample + 3), sample_us);
+        }
+
+        if (full) {
+            ClearFifo();
+            ++alive_recoveries_;
+            ++recoveries_total_;
+        }
+    }
+
+    // DIAGNOSTIC, REMOVE LATER: every 2 s, one HRALIVE line showing whether samples flow:
+    // polls, polls with data, samples, invalid samples, polls that saw an overflow, recoveries,
+    // the last RED/IR (masked and raw 3-byte fields), FIFO pointers, registers read back and
+    // I2C errors in the interval.
+    void LogAlive() {
+        const uint64_t now_us = esp_timer_get_time();
+        if (now_us - alive_start_us_ < kAliveIntervalUs) {
+            return;
+        }
+        static constexpr uint8_t kRegs[] = {0x05, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0xFF};
+        static constexpr const char* kNames[] = {"ovf", "r08", "r09", "r0A", "r0C", "r0D", "id"};
+        int len = snprintf(alive_line_, sizeof(alive_line_),
+                           "HRALIVE polls=%lu data_polls=%lu samples=%lu invalid=%lu "
+                           "ovf_polls=%lu ovf_last=%u recoveries=%lu recoveries_total=%lu "
+                           "ir=%lu red=%lu ir_raw=%02X%02X%02X red_raw=%02X%02X%02X wr=%u rd=%u",
+                           static_cast<unsigned long>(alive_polls_),
+                           static_cast<unsigned long>(alive_data_polls_),
+                           static_cast<unsigned long>(alive_samples_),
+                           static_cast<unsigned long>(alive_invalid_),
+                           static_cast<unsigned long>(alive_ovf_polls_), alive_ovf_last_,
+                           static_cast<unsigned long>(alive_recoveries_),
+                           static_cast<unsigned long>(recoveries_total_),
+                           static_cast<unsigned long>(Field18(alive_raw_ + 3)),
+                           static_cast<unsigned long>(Field18(alive_raw_)), alive_raw_[3],
+                           alive_raw_[4], alive_raw_[5], alive_raw_[0], alive_raw_[1],
+                           alive_raw_[2], alive_write_ptr_, alive_read_ptr_);
+        for (size_t i = 0; i < sizeof(kRegs) && len > 0 && len < static_cast<int>(sizeof(alive_line_));
+             ++i) {
+            uint8_t value = 0;
+            if (ReadRegister(kRegs[i], &value, 1)) {
+                len += snprintf(alive_line_ + len, sizeof(alive_line_) - len, " %s=0x%02X",
+                                kNames[i], value);
+            } else {
+                ++alive_i2c_errors_;
+                len += snprintf(alive_line_ + len, sizeof(alive_line_) - len, " %s=ERR",
+                                kNames[i]);
+            }
+        }
+        if (len > 0 && len < static_cast<int>(sizeof(alive_line_))) {
+            snprintf(alive_line_ + len, sizeof(alive_line_) - len, " i2c_err=%lu",
+                     static_cast<unsigned long>(alive_i2c_errors_));
+        }
+        ESP_LOGI(TAG, "%s", alive_line_);
+        alive_start_us_ = now_us;
+        alive_samples_ = 0;
+        alive_i2c_errors_ = 0;
+        alive_polls_ = 0;
+        alive_data_polls_ = 0;
+        alive_invalid_ = 0;
+        alive_ovf_polls_ = 0;
+        alive_recoveries_ = 0;
     }
 
     static constexpr gpio_num_t kSdaPin = GPIO_NUM_8;
@@ -547,7 +826,23 @@ private:
             init_error_ = "Failed to reset MAX30102";
             return false;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // Wait for the RESET bit (0x09 bit 6) to self-clear, up to 100 ms.
+        bool reset_done = false;
+        for (int i = 0; i < 10 && !reset_done; ++i) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            uint8_t mode = 0;
+            reset_done = ReadRegister(0x09, &mode, 1) && (mode & 0x40) == 0;
+        }
+        if (!reset_done) {
+            init_error_ = "MAX30102 reset bit did not clear within 100 ms";
+            return false;
+        }
+        // Reading INT_STATUS_1 and INT_STATUS_2 clears them (including PWR_RDY).
+        uint8_t status = 0;
+        if (!ReadRegister(0x00, &status, 1) || !ReadRegister(0x01, &status, 1)) {
+            init_error_ = "Failed to read MAX30102 interrupt status";
+            return false;
+        }
         if (!WriteRegister(0x08, 0x4F) || !WriteRegister(0x09, 0x03) ||
             !WriteRegister(0x0A, 0x27) || !WriteRegister(0x0C, kLedCurrent) ||
             !WriteRegister(0x0D, kLedCurrent) || !WriteRegister(kRegFifoWritePtr, 0) ||
@@ -567,6 +862,7 @@ private:
             ReleaseI2c();
             return false;
         }
+        init_done_us_ = esp_timer_get_time();  // set before the sensor task can read it
         if (task_ == nullptr &&
             xTaskCreate(SensorTask, "heart_rate", kTaskStackBytes, this, 1, &task_) != pdPASS) {
             task_ = nullptr;
@@ -641,12 +937,20 @@ public:
                            now_us - last_beat_us_ <= kHeartRateStaleUs;
         const int bpm = latest_bpm_;
         const size_t beats = interval_count_;
+        const uint32_t last_ir = last_ir_;
+        const uint32_t samples = total_samples_;
         xSemaphoreGive(mutex_);
 
         if (fresh) {
             return "BPM: " + std::to_string(bpm) + ". This is a reference value, not medical.";
         }
-        return "No fresh reading yet. Ask the user to rest a finger on the sensor, keep still, "
+        const char* finger_state = samples == 0              ? "no sensor data yet"
+                                   : last_ir > kFingerThreshold ? "finger detected"
+                                                                : "no finger detected";
+        return "No fresh reading yet (" + std::string(finger_state) + "; last IR " +
+               std::to_string(last_ir) + ", finger needs above " +
+               std::to_string(kFingerThreshold) + "; samples read " + std::to_string(samples) +
+               "). Ask the user to rest a finger on the sensor, keep still, "
                "and ask again in about 5 seconds. Beats detected: " +
                std::to_string(beats) + "/4. This is a reference value, not medical.";
     }
