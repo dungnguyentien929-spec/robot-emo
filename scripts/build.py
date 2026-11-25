@@ -1630,8 +1630,6 @@ def build_board(
         )
         wake_word_supported = _board_supports_wake_word(target, sdkconfig_append)
         requested_wake_word = wake_word
-        if requested_wake_word is None:  # robot-emo: optional per-build default
-            requested_wake_word = build.get("wake_word")
         if requested_wake_word is None:
             requested_wake_word = "disabled"
             if wake_word_supported:
@@ -1649,9 +1647,9 @@ def build_board(
                 "check the board opt-out and target PSRAM requirements."
             )
         user_options.extend(wake_word_options)
-        # robot-emo: a WakeNet --wake-word overrides a board "custom" default; drop the
-        # board's MultiNet model so AFE does not pick MultiNet with no commands.
-        if build.get("wake_word") == "custom" and selected_wake_word != "custom":
+        # robot-emo: the board keeps MultiNet settings for an opt-in `--wake-word custom`.
+        # Otherwise drop its MultiNet model so AFE runs WakeNet, not MultiNet with no commands.
+        if selected_wake_word != "custom":
             user_options.extend(
                 f"{item.split('=', 1)[0]}=n" for item in build_sdkconfig_append
                 if item.startswith("CONFIG_SR_MN_") and item.endswith("=y")
