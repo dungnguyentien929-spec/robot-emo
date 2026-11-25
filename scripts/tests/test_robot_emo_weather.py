@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
         return Has(text, "Thu Duc City") && Has(text, "31.4") && Has(text, "partly cloudy") &&
                Has(text, "Tomorrow") && Has(text, "thunderstorm") &&
                Has(text, "rain chance unknown") && Has(text, "5 minutes ago") &&
+               Has(text, "Today (2026-11-25)") && Has(text, "Tomorrow (2026-11-26)") &&
                Has(stale, "STALE") ? 0 : 1;
     }
     std::cerr << "unknown test " << test << '\n';
@@ -98,13 +99,37 @@ class RobotEmoWeatherTest(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory()
         cls.addClassCleanup(cls.directory.cleanup)
         build = Path(cls.directory.name)
+
+        # System cJSON first; else ESP-IDF's already downloaded component (gitignored, so a
+        # fresh checkout may not have it). Tests never fetch dependencies.
+        cjson_flags = shlex.split(os.environ.get("WEATHER_CJSON_CFLAGS", "-I/usr/include/cjson"))
+        cjson_libs = shlex.split(os.environ.get("WEATHER_CJSON_LIBS", "-lcjson"))
+        probe = subprocess.run(
+            compiler + ["-std=c++23", *cjson_flags, "-x", "c++", "-", *cjson_libs,
+                        "-o", str(build / "probe")],
+            input="#include <expected>\n#include <cJSON.h>\n"
+                  "int main() { std::expected<int, int> v; cJSON_Delete(cJSON_CreateObject()); }",
+            text=True, capture_output=True,
+        )
+        if probe.returncode:
+            cc = shlex.split(os.environ.get("CC", "cc"))
+            if not (CJSON / "cJSON.c").is_file() or not cc or not shutil.which(cc[0]):
+                raise unittest.SkipTest("requires C++23 and cJSON development files: "
+                                        + probe.stderr)
+            cjson_flags = [f"-I{CJSON}"]
+            cjson_object = build / "cjson.o"
+            subprocess.run(
+                cc + ["-std=c99", *cjson_flags, "-c", str(CJSON / "cJSON.c"),
+                      "-o", str(cjson_object)], check=True, capture_output=True, text=True,
+            )
+            cjson_libs = [str(cjson_object), "-lm"]
+
         driver = build / "driver.cc"
         driver.write_text(textwrap.dedent(DRIVER), encoding="utf-8")
         cls.executable = build / "weather_test"
         compiled = subprocess.run(
-            compiler + ["-std=c++23", f"-I{BOARD}", f"-I{CJSON}",
-                        "-x", "c", str(CJSON / "cJSON.c"),
-                        "-x", "c++", str(driver), str(BOARD / "weather_report.cc"),
+            compiler + ["-std=c++23", f"-I{BOARD}", *cjson_flags, str(driver),
+                        str(BOARD / "weather_report.cc"), *cjson_libs,
                         "-o", str(cls.executable)],
             capture_output=True, text=True,
         )
@@ -132,6 +157,15 @@ class RobotEmoWeatherTest(unittest.TestCase):
 
     def test_truncated_json_is_error(self):
         self.assertCase("error", FIXTURE[: len(FIXTURE) // 2])
+
+    def test_out_of_range_number_is_error(self):
+        # Network input: a value an int cannot hold must be rejected, not cast (UB).
+        body = FIXTURE.replace('"weather_code":2,', '"weather_code":1e300,')
+        self.assertIn("weather_code", self.assertCase("error", body))
+
+    def test_missing_date_is_error(self):
+        body = FIXTURE.replace('"time":["2026-11-25","2026-11-26"],', "")
+        self.assertIn("time", self.assertCase("error", body))
 
     def test_unknown_code_text(self):
         self.assertCase("unknown_code_text")

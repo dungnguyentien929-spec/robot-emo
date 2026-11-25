@@ -2,7 +2,9 @@
 
 #include <cJSON.h>
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 
 namespace robot_emo {
@@ -11,43 +13,51 @@ namespace {
 using JsonPtr = std::unique_ptr<cJSON, decltype(&cJSON_Delete)>;
 
 constexpr int64_t kStaleAfterS = 2 * 3600;
+constexpr double kMaxMagnitude = 1e6;
 
-bool GetNumber(const cJSON* object, const char* name, double* value) {
-    const cJSON* item = cJSON_GetObjectItemCaseSensitive(object, name);
-    if (!cJSON_IsNumber(item)) {
+// Network input: only finite numbers of plausible magnitude are accepted, so the later casts
+// to int are always defined.
+bool ToNumber(const cJSON* item, double* value) {
+    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+        std::fabs(item->valuedouble) > kMaxMagnitude) {
         return false;
     }
     *value = item->valuedouble;
     return true;
 }
 
-// Element `index` of the numeric array `name` in `object`; false if missing or not a number.
+bool GetNumber(const cJSON* object, const char* name, double* value) {
+    return ToNumber(cJSON_GetObjectItemCaseSensitive(object, name), value);
+}
+
+// Element `index` of the numeric array `name` in `object`; false if missing or invalid.
 bool GetArrayNumber(const cJSON* object, const char* name, int index, double* value) {
     const cJSON* array = cJSON_GetObjectItemCaseSensitive(object, name);
-    if (!cJSON_IsArray(array)) {
-        return false;
-    }
-    const cJSON* item = cJSON_GetArrayItem(array, index);
-    if (!cJSON_IsNumber(item)) {
-        return false;
-    }
-    *value = item->valuedouble;
-    return true;
+    return cJSON_IsArray(array) && ToNumber(cJSON_GetArrayItem(array, index), value);
 }
 
 std::expected<DailyForecast, std::string> ParseDay(const cJSON* daily, int index) {
     DailyForecast day;
+    const cJSON* dates = cJSON_GetObjectItemCaseSensitive(daily, "time");
+    const cJSON* date = cJSON_IsArray(dates) ? cJSON_GetArrayItem(dates, index) : nullptr;
+    if (!cJSON_IsString(date) || strlen(date->valuestring) != 10) {
+        return std::unexpected("missing daily.time[" + std::to_string(index) + "]");
+    }
+    day.date = date->valuestring;
     double code = 0;
     double max = 0;
     double min = 0;
     if (!GetArrayNumber(daily, "weather_code", index, &code)) {
-        return std::unexpected("missing daily.weather_code[" + std::to_string(index) + "]");
+        return std::unexpected("missing or invalid daily.weather_code[" + std::to_string(index) +
+                               "]");
     }
     if (!GetArrayNumber(daily, "temperature_2m_max", index, &max)) {
-        return std::unexpected("missing daily.temperature_2m_max[" + std::to_string(index) + "]");
+        return std::unexpected("missing or invalid daily.temperature_2m_max[" +
+                               std::to_string(index) + "]");
     }
     if (!GetArrayNumber(daily, "temperature_2m_min", index, &min)) {
-        return std::unexpected("missing daily.temperature_2m_min[" + std::to_string(index) + "]");
+        return std::unexpected("missing or invalid daily.temperature_2m_min[" +
+                               std::to_string(index) + "]");
     }
     day.weather_code = static_cast<int>(code);
     day.temp_max_c = static_cast<float>(max);
@@ -71,8 +81,9 @@ std::string Number(float value) {
 }
 
 std::string DayText(const char* label, const DailyForecast& day) {
-    std::string text = std::string(label) + ": " + Condition(day.weather_code) + ", high " +
-                       Number(day.temp_max_c) + " C, low " + Number(day.temp_min_c) + " C, ";
+    std::string text = std::string(label) + " (" + day.date + "): " + Condition(day.weather_code) +
+                       ", high " + Number(day.temp_max_c) + " C, low " + Number(day.temp_min_c) +
+                       " C, ";
     text += day.rain_probability_pct >= 0
                 ? "rain chance " + std::to_string(day.rain_probability_pct) + "%"
                 : std::string("rain chance unknown");
@@ -98,7 +109,7 @@ std::expected<WeatherReport, std::string> ParseOpenMeteo(const std::string& body
     double values[6] = {};
     for (int i = 0; i < 6; ++i) {
         if (!GetNumber(current, kCurrentFields[i], &values[i])) {
-            return std::unexpected(std::string("missing current.") + kCurrentFields[i]);
+            return std::unexpected(std::string("missing or invalid current.") + kCurrentFields[i]);
         }
     }
 

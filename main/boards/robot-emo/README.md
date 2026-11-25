@@ -116,7 +116,9 @@ longitude 106.77, time zone Asia/Ho_Chi_Minh). The data comes from
 - The tool only reads that cache, so it never waits on the network. The answer
   includes the current temperature, feels-like temperature, humidity, sky
   condition, wind and precipitation. It also gives today's and tomorrow's
-  high/low, condition and rain chance, and how long ago the data was fetched.
+  high/low, condition and rain chance, each labelled with its date, and how long
+  ago the data was fetched. The dates let the model notice when a day has
+  rolled over since the last fetch.
   The model says it in Vietnamese.
 - To change the place, edit `kWeatherPlace` and the latitude/longitude in
   `kWeatherUrl` near the top of `robot_emo_board.cc`, then rebuild.

@@ -10,6 +10,7 @@
 namespace robot_emo {
 
 struct DailyForecast {
+    std::string date;  // YYYY-MM-DD, local to the place; the model reconciles it with today
     int weather_code = 0;
     float temp_max_c = 0;
     float temp_min_c = 0;
@@ -28,7 +29,8 @@ struct WeatherReport {
 };
 
 // Parses an Open-Meteo /v1/forecast body requested with the current and daily fields in
-// main/boards/robot-emo/README.md and forecast_days=2. A missing required value is an error.
+// kWeatherUrl (robot_emo_board.cc) and forecast_days=2. A missing, non-finite or out-of-range
+// required value is an error (network input).
 std::expected<WeatherReport, std::string> ParseOpenMeteo(const std::string& body);
 
 // Open-Meteo's text for a WMO weather code, or nullptr for an unknown code.
