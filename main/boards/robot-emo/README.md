@@ -24,6 +24,12 @@ reads the sensor FIFO every 100 ms; motor auto-stop uses `esp_timer` without a
 motor worker task. A change of direction coasts (all inputs LOW) for 100 ms
 before the new direction is energized.
 
+Weak-supply protections (the robot browned out on battery while speaking):
+- `self.robot.move` answers at once and queues the move; a small `motor_sched`
+  task (3 KB stack in PSRAM) starts it once the robot has not been speaking for
+  0.8 s. A move still waiting after 15 s, or when Wi-Fi drops, is cancelled;
+  `self.robot.stop` cancels it too. Log: `Scheduled move <dir> ... wait`.
+
 ## MCP tools
 
 | Tool | Parameters | Behavior |

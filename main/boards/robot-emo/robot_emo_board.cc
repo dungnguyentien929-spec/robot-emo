@@ -72,18 +72,113 @@ private:
     // never reversed instantly: a hard reversal draws more than a start from rest and can
     // brown out the ESP32 on a weak supply.
     static constexpr int64_t kCoastUs = 100000;
+    // A move starts only once the robot has been silent this long, so motor and speaker
+    // current peaks do not add up; a move still waiting after kMaxWaitUs is cancelled.
+    static constexpr int64_t kQuietUs = 800000;
+    static constexpr int64_t kMaxWaitUs = 15000000;
+    static constexpr uint32_t kSchedulerPollMs = 100;
+    static constexpr uint32_t kSchedulerStackBytes = 3072;  // in PSRAM
 
     SemaphoreHandle_t mutex_ = nullptr;
     esp_timer_handle_t timer_ = nullptr;
+    TaskHandle_t scheduler_ = nullptr;
     bool ready_ = false;
     bool moving_ = false;
     int64_t deadline_us_ = 0;
     bool active_levels_[4] = {};  // outputs while moving_
     int64_t stopped_us_ = 0;      // when a movement last ended (0 = never moved)
-    uint32_t generation_ = 0;     // bumped by Stop(); cancels a Move() that is coasting
+    uint32_t generation_ = 0;     // bumped by Stop(); cancels pending and coasting moves
+    // The scheduled move, guarded by mutex_.
+    bool pending_ = false;
+    std::string pending_direction_;
+    int pending_duration_ms_ = 0;
+    int64_t pending_since_us_ = 0;
 
     static void AutoStop(void* arg) {
         static_cast<MotorDriver*>(arg)->StopFromTimer();
+    }
+
+    static void SchedulerEntry(void* arg) { static_cast<MotorDriver*>(arg)->SchedulerLoop(); }
+
+    // Logical wheel motion per direction, with the mounting inversion applied.
+    static bool LevelsFor(const std::string& direction, bool levels[4]) {
+        if (direction == "forward") {
+            levels[0] = true;  levels[1] = false; levels[2] = true;  levels[3] = false;
+        } else if (direction == "backward") {
+            levels[0] = false; levels[1] = true;  levels[2] = false; levels[3] = true;
+        } else if (direction == "left") {
+            levels[0] = false; levels[1] = true;  levels[2] = true;  levels[3] = false;
+        } else if (direction == "right") {
+            levels[0] = true;  levels[1] = false; levels[2] = false; levels[3] = true;
+        } else {
+            return false;
+        }
+        if (kInvertMotorA) {
+            std::swap(levels[0], levels[1]);
+        }
+        if (kInvertMotorB) {
+            std::swap(levels[2], levels[3]);
+        }
+        return true;
+    }
+
+    // Waits for each scheduled move until the robot is quiet, then starts it.
+    void SchedulerLoop() {
+        while (true) {
+            ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+            int64_t quiet_since_us = 0;
+            while (true) {
+                xSemaphoreTake(mutex_, portMAX_DELAY);
+                const bool pending = pending_;
+                const std::string direction = pending_direction_;
+                const int duration_ms = pending_duration_ms_;
+                const int64_t since_us = pending_since_us_;
+                const uint32_t generation = generation_;
+                xSemaphoreGive(mutex_);
+                if (!pending) {
+                    break;
+                }
+
+                const int64_t now_us = esp_timer_get_time();
+                const bool speaking =
+                    Application::GetInstance().GetDeviceState() == kDeviceStateSpeaking;
+                if (speaking) {
+                    quiet_since_us = 0;
+                } else if (quiet_since_us == 0) {
+                    quiet_since_us = now_us;
+                }
+                const bool timed_out = now_us - since_us > kMaxWaitUs;
+                const bool quiet = quiet_since_us != 0 && now_us - quiet_since_us >= kQuietUs;
+                const bool online = WifiManager::GetInstance().IsConnected();
+                if (timed_out || quiet || !online) {
+                    // Claim the move unless Stop() or a newer move replaced it meanwhile.
+                    xSemaphoreTake(mutex_, portMAX_DELAY);
+                    const bool claimed =
+                        pending_ && generation_ == generation && pending_since_us_ == since_us;
+                    if (claimed) {
+                        pending_ = false;
+                    }
+                    xSemaphoreGive(mutex_);
+                    if (claimed) {
+                        if (!online) {
+                            ESP_LOGW(TAG, "Scheduled move %s cancelled: Wi-Fi lost",
+                                     direction.c_str());
+                        } else if (!quiet) {
+                            ESP_LOGW(TAG, "Scheduled move %s cancelled: robot kept speaking",
+                                     direction.c_str());
+                        } else {
+                            const esp_err_t err = MoveNow(direction, duration_ms, generation);
+                            ESP_LOGI(TAG, "Scheduled move %s %d ms after %lld ms wait: %s",
+                                     direction.c_str(), duration_ms,
+                                     static_cast<long long>((now_us - since_us) / 1000),
+                                     esp_err_to_name(err));
+                        }
+                    }
+                    continue;  // pick up a newer pending move, if any
+                }
+                vTaskDelay(pdMS_TO_TICKS(kSchedulerPollMs));
+            }
+        }
     }
 
     void SetAllLow() {
@@ -158,40 +253,51 @@ public:
             ESP_LOGE(TAG, "Failed to create motor auto-stop timer: %s", esp_err_to_name(err));
             return;
         }
+        if (xTaskCreatePinnedToCoreWithCaps(SchedulerEntry, "motor_sched", kSchedulerStackBytes,
+                                            this, 2, &scheduler_, tskNO_AFFINITY,
+                                            MALLOC_CAP_SPIRAM) != pdPASS) {
+            scheduler_ = nullptr;
+            ESP_LOGE(TAG, "Failed to create motor scheduler task; motors remain LOW");
+            return;
+        }
         ready_ = true;
         ESP_LOGI(TAG, "Motor outputs initialized LOW (GPIO11-14)");
     }
 
-    esp_err_t Move(const std::string& direction, int duration_ms) {
+    // Validates and queues a move; it starts once the robot is quiet (see SchedulerLoop()).
+    // A newer move replaces one still waiting; Stop() cancels it.
+    esp_err_t Schedule(const std::string& direction, int duration_ms) {
         if (!ready_) {
             return ESP_ERR_INVALID_STATE;
         }
-        if (duration_ms < 500 || duration_ms > 5000) {
-            return ESP_ERR_INVALID_ARG;
-        }
-
         bool levels[4];
-        if (direction == "forward") {
-            levels[0] = true;  levels[1] = false; levels[2] = true;  levels[3] = false;
-        } else if (direction == "backward") {
-            levels[0] = false; levels[1] = true;  levels[2] = false; levels[3] = true;
-        } else if (direction == "left") {
-            levels[0] = false; levels[1] = true;  levels[2] = true;  levels[3] = false;
-        } else if (direction == "right") {
-            levels[0] = true;  levels[1] = false; levels[2] = false; levels[3] = true;
-        } else {
+        if (duration_ms < 500 || duration_ms > 5000 || !LevelsFor(direction, levels)) {
             return ESP_ERR_INVALID_ARG;
         }
-        // The table above is logical wheel motion; apply mounting inversion here only.
-        if (kInvertMotorA) {
-            std::swap(levels[0], levels[1]);
-        }
-        if (kInvertMotorB) {
-            std::swap(levels[2], levels[3]);
+        xSemaphoreTake(mutex_, portMAX_DELAY);
+        pending_ = true;
+        pending_direction_ = direction;
+        pending_duration_ms_ = duration_ms;
+        pending_since_us_ = esp_timer_get_time();
+        xSemaphoreGive(mutex_);
+        xTaskNotifyGive(scheduler_);
+        return ESP_OK;
+    }
+
+private:
+    // Starts a move now, unless Stop() ran since `generation` was read.
+    esp_err_t MoveNow(const std::string& direction, int duration_ms, uint32_t generation) {
+        bool levels[4];
+        if (!LevelsFor(direction, levels)) {
+            return ESP_ERR_INVALID_ARG;
         }
 
         if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE) {
             return ESP_ERR_TIMEOUT;
+        }
+        if (generation != generation_) {
+            xSemaphoreGive(mutex_);
+            return ESP_ERR_INVALID_STATE;  // stopped meanwhile
         }
 
         esp_timer_stop(timer_);
@@ -208,7 +314,6 @@ public:
             // it; a Stop() during the coast bumps generation_ and cancels this move.
             const int64_t wait_us = stopped_us_ + kCoastUs - esp_timer_get_time();
             if (stopped_us_ != 0 && wait_us > 0) {
-                const uint32_t generation = generation_;
                 xSemaphoreGive(mutex_);
                 vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000) + 1);
                 if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE) {
@@ -242,6 +347,8 @@ public:
         return err;
     }
 
+public:
+    // Stops the motors and cancels a scheduled move.
     esp_err_t Stop() {
         if (mutex_ == nullptr) {
             SetAllLow();
@@ -260,6 +367,7 @@ public:
         }
         moving_ = false;
         deadline_us_ = 0;
+        pending_ = false;
         ++generation_;
         xSemaphoreGive(mutex_);
         return ESP_OK;
@@ -1020,7 +1128,8 @@ private:
             "self.robot.move",
             "Use when the user asks the robot to move forward, backward, or turn left/right. "
             "Direction must be exactly one of: forward, backward, left, right. "
-            "Starts the selected movement and automatically stops after duration_ms (500-5000; default 3000).",
+            "The movement starts once the robot has finished speaking (to protect its power supply) "
+            "and automatically stops after duration_ms (500-5000; default 3000).",
             PropertyList({Property("direction", kPropertyTypeString),
                           Property("duration_ms", kPropertyTypeInteger, 3000, 500, 5000)}),
             [this](const PropertyList& properties) -> ToolResult {
@@ -1034,7 +1143,7 @@ private:
                     return std::unexpected("Cannot move: Wi-Fi connection is not available");
                 }
 
-                esp_err_t err = motor_driver_.Move(direction, duration_ms);
+                esp_err_t err = motor_driver_.Schedule(direction, duration_ms);
                 if (err != ESP_OK) {
                     const std::string result = std::string("error: ") + esp_err_to_name(err);
                     ESP_LOGI(TAG,
@@ -1042,8 +1151,9 @@ private:
                              direction.c_str(), duration_ms, result.c_str());
                     return std::unexpected(std::string("Motor move failed: ") + esp_err_to_name(err));
                 }
-                const std::string result = "moving " + direction + " for " +
-                                           std::to_string(duration_ms) + " ms";
+                const std::string result = "will move " + direction + " for " +
+                                           std::to_string(duration_ms) +
+                                           " ms as soon as the robot stops speaking";
                 ESP_LOGI(TAG,
                          "MCP self.robot.move args={direction:%s,duration_ms:%d} result=%s",
                          direction.c_str(), duration_ms, result.c_str());
