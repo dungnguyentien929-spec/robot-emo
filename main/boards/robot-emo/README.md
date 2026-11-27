@@ -20,7 +20,8 @@ The motor outputs are driven LOW during board initialization. Motor movement
 and stop, plus heart-rate measurement, are model-visible MCP tools. A missing
 MAX30102 does not prevent boot; its tool reports the initialization error.
 The heart-rate sampler uses a 5120-byte low-priority task stack; motor
-auto-stop uses `esp_timer` without a motor worker task.
+auto-stop uses `esp_timer` without a motor worker task. A change of direction
+coasts (all inputs LOW) for 100 ms before the new direction is energized.
 
 ## MCP tools
 

@@ -68,11 +68,19 @@ constexpr const char* kWeatherUrl =
 
 class MotorDriver {
 private:
+    // Coast time (all inputs LOW) before energizing a new direction, so a running motor is
+    // never reversed instantly: a hard reversal draws more than a start from rest and can
+    // brown out the ESP32 on a weak supply.
+    static constexpr int64_t kCoastUs = 100000;
+
     SemaphoreHandle_t mutex_ = nullptr;
     esp_timer_handle_t timer_ = nullptr;
     bool ready_ = false;
     bool moving_ = false;
     int64_t deadline_us_ = 0;
+    bool active_levels_[4] = {};  // outputs while moving_
+    int64_t stopped_us_ = 0;      // when a movement last ended (0 = never moved)
+    uint32_t generation_ = 0;     // bumped by Stop(); cancels a Move() that is coasting
 
     static void AutoStop(void* arg) {
         static_cast<MotorDriver*>(arg)->StopFromTimer();
@@ -109,6 +117,7 @@ private:
             SetAllLow();
             moving_ = false;
             deadline_us_ = 0;
+            stopped_us_ = esp_timer_get_time();
             ESP_LOGI(TAG, "Motor auto-stop: all four outputs LOW");
         }
         xSemaphoreGive(mutex_);
@@ -186,16 +195,46 @@ public:
         }
 
         esp_timer_stop(timer_);
-        SetAllLow();
-        esp_err_t err = SetOutputs(levels[0], levels[1], levels[2], levels[3]);
+        const bool same_direction = moving_ && std::equal(levels, levels + 4, active_levels_);
+        esp_err_t err = ESP_OK;
+        if (!same_direction) {
+            if (moving_) {
+                SetAllLow();
+                moving_ = false;
+                deadline_us_ = 0;
+                stopped_us_ = esp_timer_get_time();
+            }
+            // Coast with the mutex released, so Stop() and the auto-stop timer never wait on
+            // it; a Stop() during the coast bumps generation_ and cancels this move.
+            const int64_t wait_us = stopped_us_ + kCoastUs - esp_timer_get_time();
+            if (stopped_us_ != 0 && wait_us > 0) {
+                const uint32_t generation = generation_;
+                xSemaphoreGive(mutex_);
+                vTaskDelay(pdMS_TO_TICKS((wait_us + 999) / 1000) + 1);
+                if (xSemaphoreTake(mutex_, portMAX_DELAY) != pdTRUE) {
+                    SetAllLow();
+                    return ESP_ERR_TIMEOUT;
+                }
+                if (generation != generation_ || moving_) {
+                    // Stopped, or another move started meanwhile: do not override it.
+                    xSemaphoreGive(mutex_);
+                    return ESP_ERR_INVALID_STATE;
+                }
+            }
+            err = SetOutputs(levels[0], levels[1], levels[2], levels[3]);
+        }
         if (err == ESP_OK) {
             deadline_us_ = esp_timer_get_time() + static_cast<int64_t>(duration_ms) * 1000;
             err = esp_timer_start_once(timer_, static_cast<uint64_t>(duration_ms) * 1000);
         }
         if (err == ESP_OK) {
             moving_ = true;
+            std::copy(levels, levels + 4, active_levels_);
         } else {
             SetAllLow();
+            if (moving_) {
+                stopped_us_ = esp_timer_get_time();
+            }
             moving_ = false;
             deadline_us_ = 0;
         }
@@ -216,8 +255,12 @@ public:
             esp_timer_stop(timer_);
         }
         SetAllLow();
+        if (moving_) {
+            stopped_us_ = esp_timer_get_time();
+        }
         moving_ = false;
         deadline_us_ = 0;
+        ++generation_;
         xSemaphoreGive(mutex_);
         return ESP_OK;
     }
