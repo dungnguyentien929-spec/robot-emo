@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>Robot Emo – phác thảo màn hình OLED</title>
+<style>
+  body { background:#14161a; color:#e8e8e8; font-family:system-ui,Segoe UI,sans-serif; margin:24px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  .sub { color:#9aa3ad; margin:0 0 18px; font-size:14px; }
+  .row { display:flex; gap:22px; flex-wrap:wrap; }
+  .card { background:#1e2127; border:2px solid #2c313a; border-radius:12px; padding:14px; width:560px; }
+  .card h2 { font-size:17px; margin:0 0 6px; }
+  .card p { color:#aab2bc; font-size:13px; margin:8px 0 0; line-height:1.45; }
+  .bezel { background:#0a0a0a; border-radius:8px; padding:12px; display:inline-block; box-shadow:inset 0 0 0 2px #333; }
+  canvas { display:block; image-rendering:pixelated; }
+  .controls { margin:18px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
+  .controls b { margin-right:6px; font-size:14px; }
+  button { background:#2a2f38; color:#e8e8e8; border:1px solid #3a414c; border-radius:6px; padding:6px 10px; cursor:pointer; font-size:13px; }
+  button.on { background:#3b82f6; border-color:#3b82f6; }
+  .note { color:#7d8590; font-size:12px; margin-top:16px; max-width:1160px; }
+</style>
+</head>
+<body>
+<h1>Robot Emo – 3 hướng cho màn hình OLED 128×64</h1>
+<p class="sub">Đây là mô phỏng đúng độ phân giải 128×64, 1 màu (phóng to ×4). Bấm các nút để đổi cảm xúc và trạng thái – cả 3 màn hình cùng đổi theo.</p>
+
+<div class="controls" id="emo"><b>Cảm xúc:</b></div>
+<div class="controls" id="state"><b>Trạng thái:</b></div>
+<div class="controls" id="color"><b>Màu màn hình:</b></div>
+
+<div class="row">
+  <div class="card"><h2>A – Toàn mắt</h2><div class="bezel"><canvas id="cA"></canvas></div>
+    <p>Hai mắt lớn chiếm cả màn hình, chớp mắt, liếc quanh, đổi hình theo cảm xúc. Khi nói, mắt nhún nhẹ theo nhịp. Không hiện chữ hội thoại.</p></div>
+  <div class="card"><h2>B – Mắt + phụ đề</h2><div class="bezel"><canvas id="cB"></canvas></div>
+    <p>Mắt nhỏ hơn ở phía trên, một dòng chữ chạy ở đáy khi robot nghe/nói. Lúc rảnh, dòng đáy hiện giờ và nhiệt độ.</p></div>
+  <div class="card"><h2>C – Khuôn mặt + thanh trạng thái</h2><div class="bezel"><canvas id="cC"></canvas></div>
+    <p>Thanh trên cùng (Wi-Fi, trạng thái, giờ). Mặt có mắt và miệng; miệng mấp máy khi nói. Không hiện chữ hội thoại.</p></div>
+</div>
+<p class="note">Lưu ý: chữ trong bản phác thảo được vẽ bằng font của trình duyệt rồi ép về 1 bit nên hơi thô – trên robot sẽ dùng font của firmware. Thời tiết/giờ là dữ liệu giả.</p>
+
+<script>
+const W = 128, H = 64, S = 4;
+const EMOS = [
+  ["neutral","Bình thường"],["happy","Vui"],["laughing","Cười lớn"],["sad","Buồn"],["crying","Khóc"],
+  ["angry","Giận"],["surprised","Ngạc nhiên"],["thinking","Suy nghĩ"],["sleepy","Buồn ngủ"],
+  ["loving","Yêu thích"],["winking","Nháy mắt"],["confused","Bối rối"],["cool","Ngầu"]];
+const STATES = [["idle","Rảnh"],["listening","Đang nghe"],["speaking","Đang nói"]];
+const COLORS = [["#ffffff","Trắng"],["#4fc3ff","Xanh"],["split","Vàng/xanh (2 màu)"]];
+let emo = "neutral", state = "idle", color = "#ffffff";
+const CHAT = "Hôm nay ở Thủ Đức trời nhiều mây, 27.6 độ, cảm giác như 33 độ. Nhớ mang ô nhé!";
+
+function buttons(id, list, get, set) {
+  const box = document.getElementById(id);
+  list.forEach(([k, label]) => {
+    const b = document.createElement("button"); b.textContent = label; b.dataset.k = k;
+    b.onclick = () => { set(k); [...box.querySelectorAll("button")].forEach(x => x.classList.toggle("on", x.dataset.k === get())); };
+    if (k === get()) b.classList.add("on");
+    box.appendChild(b);
+  });
+}
+buttons("emo", EMOS, () => emo, k => { emo = k; });
+buttons("state", STATES, () => state, k => { state = k; tick0 = performance.now(); });
+buttons("color", COLORS, () => color, k => { color = k; });
+
+// ---- eye model: targets per emotion, smoothly interpolated ----
+function target(e) {
+  const t = { w: 1, h: 1, r: 0.3, lidIn: 0, lidOut: 0, happy: 0, lookX: 0, lookY: 0, leftClose: 0, small: 0 };
+  switch (e) {
+    case "happy": t.happy = 0.55; break;
+    case "laughing": t.happy = 0.75; t.h = 0.8; break;
+    case "sad": t.lidOut = 0.45; t.lookY = 0.35; t.h = 0.9; break;
+    case "crying": t.lidOut = 0.5; t.lookY = 0.3; break;
+    case "angry": t.lidIn = 0.5; t.h = 0.85; break;
+    case "surprised": t.w = 1.15; t.h = 1.2; t.r = 0.5; break;
+    case "thinking": t.lookX = 0.7; t.lookY = -0.6; t.small = 0.15; break;
+    case "sleepy": t.h = 0.22; t.lookY = 0.4; break;
+    case "loving": t.happy = 0.35; break;
+    case "winking": t.leftClose = 1; t.happy = 0.5; break;
+    case "confused": t.small = 0.35; t.lookX = -0.3; break;
+    case "cool": t.h = 0.55; t.lidIn = 0.1; break;
+  }
+  return t;
+}
+const cur = target("neutral");
+let blinkUntil = 0, nextBlink = 1500, glance = { x: 0, y: 0 }, nextGlance = 2500, tick0 = 0;
+
+function update(now) {
+  const t = target(emo);
+  for (const k in t) cur[k] += (t[k] - cur[k]) * 0.18;
+  if (now > nextBlink && emo !== "sleepy") { blinkUntil = now + 140; nextBlink = now + 1800 + Math.random() * 3500; }
+  if (now > nextGlance) {
+    glance = (state === "idle" && Math.random() < 0.7) ? { x: (Math.random() - 0.5) * 0.9, y: (Math.random() - 0.5) * 0.5 } : { x: 0, y: 0 };
+    nextGlance = now + 1500 + Math.random() * 2500;
+  }
+}
+
+function rrect(g, x, y, w, h, r) {
+  r = Math.max(0, Math.min(r, w / 2, h / 2));
+  g.beginPath(); g.roundRect(x, y, w, h, r); g.fill();
+}
+function heart(g, cx, cy, s) {
+  g.beginPath(); g.moveTo(cx, cy + s * 0.9);
+  g.bezierCurveTo(cx - s * 1.4, cy - s * 0.2, cx - s * 0.6, cy - s * 1.2, cx, cy - s * 0.4);
+  g.bezierCurveTo(cx + s * 0.6, cy - s * 1.2, cx + s * 1.4, cy - s * 0.2, cx, cy + s * 0.9); g.fill();
+}
+
+// draws both eyes inside box (bx,by,bw,bh)
+function eyes(g, now, bx, by, bw, bh, base) {
+  const blinking = now < blinkUntil;
+  const talk = state === "speaking" ? Math.abs(Math.sin(now / 110)) * 2 : 0;
+  const listen = state === "listening" ? 1 : 0;
+  const lx = (cur.lookX + glance.x) * base * 0.35, ly = (cur.lookY + glance.y) * base * 0.25 - talk;
+  const gap = base * 0.55;
+  for (const side of [-1, 1]) {
+    let w = base * cur.w * (side === 1 ? 1 - cur.small : 1);
+    let h = base * cur.h * (side === 1 ? 1 - cur.small : 1) * (1 + listen * 0.08);
+    const cx = bx + bw / 2 + side * (gap / 2 + base / 2) + lx, cy = by + bh / 2 + ly;
+    const closed = blinking || (side === -1 && cur.leftClose > 0.5);
+    g.fillStyle = "#fff";
+    if (emo === "loving") { heart(g, cx, cy, base * 0.42 * (1 + Math.sin(now / 180) * 0.08)); continue; }
+    if (closed) { rrect(g, cx - w / 2, cy - 1.5, w, 3, 1.5); continue; }
+    rrect(g, cx - w / 2, cy - h / 2, w, h, base * cur.r);
+    g.fillStyle = "#000";
+    if (cur.happy > 0.02) { g.beginPath(); g.ellipse(cx, cy + h * (1.05 - cur.happy), w * 0.75, h * 0.62, 0, 0, Math.PI * 2); g.fill(); }
+    const inner = -side, lidIn = cur.lidIn * h, lidOut = cur.lidOut * h;
+    if (lidIn > 0.5) { g.beginPath(); g.moveTo(cx + inner * w / 2 + inner * 2, cy - h / 2 + lidIn); g.lineTo(cx - inner * w / 2 - inner * 2, cy - h / 2 - 2); g.lineTo(cx + inner * w / 2 + inner * 2, cy - h / 2 - 2); g.fill(); }
+    if (lidOut > 0.5) { g.beginPath(); g.moveTo(cx - inner * w / 2 - inner * 2, cy - h / 2 + lidOut); g.lineTo(cx + inner * w / 2 + inner * 2, cy - h / 2 - 2); g.lineTo(cx - inner * w / 2 - inner * 2, cy - h / 2 - 2); g.fill(); }
+    if (emo === "cool") { g.fillStyle = "#fff"; g.fillRect(cx - w / 2 - 3, cy - h / 2 - 2, w + 6, 3); }
+    if (emo === "crying" && side === 1) {
+      g.fillStyle = "#fff"; const ty = (now / 12) % (bh * 0.6);
+      g.beginPath(); g.ellipse(cx + w * 0.3, cy + h / 2 + 2 + ty, 1.6, 2.6, 0, 0, Math.PI * 2); g.fill();
+    }
+  }
+  g.fillStyle = "#fff";
+  if (emo === "sleepy") { const z = (now / 40) % 20; g.font = "bold 9px monospace"; g.fillText("z", bx + bw - 14, by + 14 - z * 0.4); g.fillText("Z", bx + bw - 8, by + 8 - z * 0.3); }
+  if (emo === "confused") { g.font = "bold 12px sans-serif"; g.fillText("?", bx + bw - 10, by + 12); }
+  if (emo === "thinking") { for (let i = 0; i < 3; i++) if (Math.floor(now / 350) % 4 > i) g.fillRect(bx + bw - 18 + i * 5, by + 4, 2, 2); }
+}
+
+function mouth(g, now, cx, cy) {
+  g.fillStyle = "#fff"; g.strokeStyle = "#fff"; g.lineWidth = 2;
+  if (state === "speaking") { const o = 1 + Math.abs(Math.sin(now / 90)) * 4; g.beginPath(); g.ellipse(cx, cy, 5, o, 0, 0, Math.PI * 2); g.fill(); return; }
+  g.beginPath();
+  if (["happy","laughing","loving","winking","cool"].includes(emo)) g.arc(cx, cy - 4, 6, 0.15 * Math.PI, 0.85 * Math.PI);
+  else if (["sad","crying"].includes(emo)) g.arc(cx, cy + 5, 6, 1.15 * Math.PI, 1.85 * Math.PI);
+  else if (emo === "surprised") { g.ellipse(cx, cy, 3, 4, 0, 0, Math.PI * 2); g.stroke(); return; }
+  else if (emo === "angry") { g.moveTo(cx - 6, cy + 1); g.lineTo(cx + 6, cy - 1); }
+  else { g.moveTo(cx - 5, cy); g.lineTo(cx + 5, cy); }
+  g.stroke();
+}
+
+function wifi(g, x, y) { g.fillStyle = "#fff"; g.fillRect(x, y + 5, 2, 2); g.fillRect(x + 3, y + 3, 2, 4); g.fillRect(x + 6, y + 1, 2, 6); }
+
+function ticker(g, now, y, text) {
+  g.font = "10px sans-serif"; g.fillStyle = "#fff";
+  const w = g.measureText(text).width + 30, off = ((now - tick0) / 28) % w;
+  g.fillText(text, 4 - off, y); g.fillText(text, 4 - off + w, y);
+}
+function clock() { const d = new Date(); return d.toTimeString().slice(0, 5); }
+
+const draws = {
+  A(g, now) { eyes(g, now, 0, 0, W, H, 34); },
+  B(g, now) {
+    eyes(g, now, 0, 0, W, 47, 24);
+    g.fillStyle = "#fff"; g.fillRect(0, 48, W, 1);
+    g.fillStyle = "#000"; g.fillRect(0, 49, W, 15);
+    if (state === "idle") { g.fillStyle = "#fff"; g.font = "10px sans-serif"; g.fillText(clock() + "   ☁ 27°C  Thủ Đức", 4, 60); }
+    else if (state === "listening") { g.fillStyle = "#fff"; g.font = "10px sans-serif"; g.fillText("Đang nghe" + ".".repeat(Math.floor(now / 400) % 4), 4, 60); }
+    else ticker(g, now, 60, CHAT);
+  },
+  C(g, now) {
+    wifi(g, 2, 1); g.fillStyle = "#fff"; g.font = "9px sans-serif";
+    const st = { idle: "Sẵn sàng", listening: "Đang nghe", speaking: "Đang nói" }[state];
+    g.fillText(st, 64 - g.measureText(st).width / 2, 9); g.fillText(clock(), W - 26, 9);
+    g.fillRect(0, 12, W, 1);
+    eyes(g, now, 0, 12, W, 34, 20);
+    mouth(g, now, W / 2, 54);
+  },
+};
+
+const panels = ["A","B","C"].map(id => {
+  const big = document.getElementById("c" + id); big.width = W * S; big.height = H * S;
+  const small = document.createElement("canvas"); small.width = W; small.height = H;
+  return { id, big: big.getContext("2d"), g: small.getContext("2d") };
+});
+
+function frame(now) {
+  update(now);
+  for (const p of panels) {
+    const g = p.g; g.fillStyle = "#000"; g.fillRect(0, 0, W, H);
+    draws[p.id](g, now);
+    const px = g.getImageData(0, 0, W, H).data;
+    const B = p.big; B.fillStyle = "#050505"; B.fillRect(0, 0, W * S, H * S);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = (y * W + x) * 4; if (px[i] + px[i + 1] + px[i + 2] < 384) continue;
+      B.fillStyle = color === "split" ? (y < 16 ? "#ffd23f" : "#4fc3ff") : color;
+      B.fillRect(x * S, y * S, S - 1, S - 1);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
