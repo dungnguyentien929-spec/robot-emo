@@ -1,177 +1,99 @@
-# An MCP-based Chatbot
+# Robot Emo
 
-(English | [中文](README_zh.md) | [日本語](README_ja.md))
+Robot để bàn biết nói chuyện bằng tiếng Việt, chạy trên ESP32-S3. Emo nghe bạn nói, trả lời bằng giọng nói,
+chạy tới lui bằng bánh xe, đo nhịp tim, xem thời tiết và thể hiện cảm xúc bằng đôi mắt trên màn hình OLED.
 
-## Introduction
+Đây là bản fork của [78/xiaozhi-esp32](https://github.com/78/xiaozhi-esp32) (XiaoZhi AI, phiên bản 2.6.0).
+Phần riêng của Robot Emo nằm trong [main/boards/robot-emo/](main/boards/robot-emo/); phần còn lại là code gốc
+của XiaoZhi.
 
-📖 [XiaoZhi AI Guides & Help](https://docs.xiaozhi.me/en/)
+## Emo làm được gì
 
-👉 [Human: Give AI a camera vs AI: Instantly finds out the owner hasn't washed hair for three days【bilibili】](https://www.bilibili.com/video/BV1bpjgzKEhd/)
+- **Trò chuyện tiếng Việt** qua máy chủ chính thức [xiaozhi.me](https://xiaozhi.me): nhận giọng nói trên đám mây,
+  mô hình ngôn ngữ lớn trả lời, đọc lại bằng giọng nói. Tính cách của Emo được cấu hình trên xiaozhi.me.
+- **Từ đánh thức** "Hi ESP" (WakeNet chạy ngay trên chip, không cần mạng).
+- **Di chuyển** bằng hai động cơ qua L298N: tiến, lùi, quay trái, quay phải, dừng. Có nhiều lớp an toàn: chân
+  động cơ ở mức LOW khi khởi động, tự dừng sau tối đa 5 giây, dừng khi mất Wi-Fi.
+- **Đo nhịp tim** bằng cảm biến MAX30102 (chỉ để tham khảo, không dùng cho y tế).
+- **Thời tiết** hiện tại, hôm nay và ngày mai cho Thủ Đức, lấy từ [Open-Meteo](https://open-meteo.com) (miễn phí,
+  không cần API key), lưu bộ nhớ đệm và làm mới mỗi 15 phút.
+- **Đôi mắt hoạt hình** trên OLED 128x64: chớp mắt, liếc nhìn, đổi biểu cảm theo cảm xúc của câu trả lời.
 
-👉 [Handcraft your AI girlfriend, beginner's guide【bilibili】](https://www.bilibili.com/video/BV1XnmFYLEJN/)
+Các chức năng của robot được đưa cho mô hình ngôn ngữ dưới dạng công cụ MCP, nên bạn chỉ cần nói tự nhiên,
+ví dụ "đi tới 3 giây", "mai có mưa không", "đo nhịp tim cho tôi".
 
-As a voice interaction entry, the XiaoZhi AI chatbot leverages the AI capabilities of large models like Qwen / DeepSeek, and achieves multi-terminal control via the MCP protocol.
+| Công cụ MCP | Chức năng |
+| --- | --- |
+| `self.robot.move` | Di chuyển theo hướng `forward`, `backward`, `left`, `right` trong 0,5 đến 5 giây |
+| `self.robot.stop` | Dừng ngay |
+| `self.sensor.get_heart_rate` | Đọc nhịp tim (BPM) |
+| `self.weather.get` | Thời tiết Thủ Đức hiện tại, hôm nay và ngày mai |
 
-<img src="docs/mcp-based-graph.jpg" alt="Control everything via MCP" width="320">
+## Phần cứng
 
-## Recent Updates
+| Linh kiện | Kết nối (GPIO) |
+| --- | --- |
+| ESP32-S3 N16R8 (16 MB flash, 8 MB PSRAM octal) | |
+| Micro INMP441 | WS 4, SCK 5, DIN 6 |
+| Ampli loa MAX98357A + loa | DIN 7, BCLK 15, LRC 16 |
+| OLED SSD1306 128x64 (I2C, địa chỉ 0x3C) | SDA 41, SCL 42 |
+| Driver động cơ L298N (không dùng chân ENA/ENB) | IN1 11, IN2 12, IN3 13, IN4 14 |
+| Cảm biến nhịp tim MAX30102 (I2C, địa chỉ 0x57) | SDA 8, SCL 9 |
+| Nút BOOT | 0 |
 
-- The project now requires ESP-IDF v6.0.1 or later. [ESP-IDF `release/v6.1`](https://github.com/espressif/esp-idf/tree/release/v6.1) is the recommended SDK branch. ESP-IDF 5.x is no longer supported. The current matrix contains 171 variants; ESP32-S31 builds require IDF 6.1 or later.
-- MQTT and BluFi cryptographic code has migrated to PSA Crypto. IDF 6 component splits and third-party dependency compatibility have also been addressed.
-- Audio pipeline concurrency, MQTT/UDP packet validation, and release-matrix selection have been hardened.
-- ESP32-P4 Rev1 and Rev3 are both supported on IDF 6 with ESP-SR 2.4.7.
+GPIO 35 đến 37 thuộc về PSRAM octal, không dùng được. Chiều quay của từng động cơ chỉnh được trong code
+(`kInvertMotorA`, `kInvertMotorB`) mà không cần đổi dây.
 
-### Features Implemented
+### Lưu ý về nguồn điện
 
-- Wi-Fi, wired Ethernet, USB RNDIS, and ML307/EC801E or NT26 Cat.1 4G networking; supported boards can switch between Wi-Fi and 4G
-- Offline voice wake-up with [ESP-SR](https://github.com/espressif/esp-sr), including customizable wake words
-- Two communication transports: [WebSocket](docs/websocket.md) and [MQTT + UDP](docs/mqtt-udp.md)
-- Opus audio streaming with conventional streaming ASR + LLM + TTS pipelines and Realtime end-to-end voice models; AEC-capable hardware supports realtime full-duplex interaction
-- Speaker recognition, identifies the current speaker [3D Speaker](https://github.com/modelscope/3D-Speaker)
-- OLED / LCD displays with emoji and rich expression support, plus camera vision input on supported boards
-- Battery display and power management
-- 39 interface languages, with localized voice prompts where available and English fallback
-- ESP32, ESP32-C3, ESP32-C5, ESP32-C6, ESP32-S3, and ESP32-P4 chip platforms
-- Wi-Fi provisioning through hotspot or BluFi
-- Device-side MCP for device control (Speaker, LED, Servo, GPIO, etc.)
-- Cloud-side MCP to extend large model capabilities (smart home control, PC desktop operation, knowledge search, email, etc.)
-- Customizable wake words, fonts, emojis, and chat backgrounds with online web-based editing ([Custom Assets Generator](https://github.com/78/xiaozhi-assets-generator))
+Động cơ và loa kéo dòng đỉnh lớn. Nếu ESP32 dùng chung nguồn yếu với chúng, điện áp sẽ sụt và chip tự khởi động
+lại (trong log có dòng `Brownout detector was triggered`). Nên làm:
 
-## Hardware
+- Cấp cho ESP32 một nguồn 5 V ổn định riêng (mạch tăng áp hoặc hạ áp từ 2 A trở lên), không lấy từ chân "5V" của
+  module động cơ.
+- Không cấp nguồn cho MAX98357A từ chân 3V3 của board ESP32; lấy từ 5 V hoặc trực tiếp từ pin.
+- Nối chung GND, thêm tụ 470 đến 1000 µF ở đầu vào driver động cơ và tụ 0,1 µF trên mỗi động cơ.
 
-### Breadboard DIY Practice
+Firmware có sẵn vài biện pháp giảm sụt áp: động cơ chỉ chạy sau khi robot nói xong, nghỉ 100 ms trước khi đổi
+chiều, và âm lượng loa tối đa là 50.
 
-Follow the step-by-step breadboard tutorial:
+## Build và nạp firmware
 
-👉 [ESP32-S3 Breadboard Tutorial](https://docs.xiaozhi.me/en/hardware/breadboard-esp32-s3.html)
+Cần [ESP-IDF v6.0.3](https://docs.espressif.com/projects/esp-idf/). Sau khi kích hoạt môi trường ESP-IDF:
 
-Breadboard demo:
+```powershell
+python scripts\build.py robot-emo --name robot-emo --language vi-VN
+idf.py -p COMx flash monitor
+```
 
-![Breadboard Demo](docs/v1/wiring2.jpg)
+Thay `COMx` bằng cổng của board. Lần đầu chạy, robot phát Wi-Fi để bạn nhập mạng nhà, sau đó đọc mã kích hoạt
+để bạn thêm thiết bị trên [xiaozhi.me](https://xiaozhi.me). Vị trí thời tiết sửa ở `kWeatherPlace` và
+`kWeatherUrl` trong [robot_emo_board.cc](main/boards/robot-emo/robot_emo_board.cc).
 
-### Supports 138 Board Directories and 171 Release Variants (Partial List)
+Chi tiết kỹ thuật (thuật toán đo nhịp tim, các lỗi đặc thù của module MAX30102, thiết kế đôi mắt, bộ nhớ) nằm
+trong [README của board](main/boards/robot-emo/README.md).
 
-- <a href="https://oshwhub.com/li-chuang-kai-fa-ban/li-chuang-shi-zhan-pai-esp32-s3-kai-fa-ban" target="_blank" title="LiChuang ESP32-S3 Development Board">LiChuang ESP32-S3 Development Board</a>
-- <a href="https://github.com/espressif/esp-box" target="_blank" title="Espressif ESP32-S3-BOX-3">Espressif ESP32-S3-BOX-3</a>
-- <a href="https://docs.m5stack.com/zh_CN/core/CoreS3" target="_blank" title="M5Stack CoreS3">M5Stack CoreS3</a>
-- <a href="https://docs.m5stack.com/en/atom/Atomic%20Echo%20Base" target="_blank" title="AtomS3R + Echo Base">M5Stack AtomS3R + Echo Base</a>
-- <a href="https://gf.bilibili.com/item/detail/1108782064" target="_blank" title="Magic Button 2.4">Magic Button 2.4</a>
-- <a href="https://www.waveshare.net/shop/ESP32-S3-Touch-AMOLED-1.8.htm" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">Waveshare ESP32-S3-Touch-AMOLED-1.8</a>
-- <a href="https://github.com/Xinyuan-LilyGO/T-Circle-S3" target="_blank" title="LILYGO T-Circle-S3">LILYGO T-Circle-S3</a>
-- <a href="https://oshwhub.com/tenclass01/xmini_c3" target="_blank" title="XiaGe Mini C3">XiaGe Mini C3</a>
-- <a href="https://oshwhub.com/movecall/cuican-ai-pendant-lights-up-y" target="_blank" title="Movecall CuiCan ESP32S3">CuiCan AI Pendant</a>
-- <a href="https://github.com/WMnologo/xingzhi-ai" target="_blank" title="WMnologo-Xingzhi-1.54">WMnologo-Xingzhi-1.54TFT</a>
-- <a href="https://www.seeedstudio.com/SenseCAP-Watcher-W1-A-p-5979.html" target="_blank" title="SenseCAP Watcher">SenseCAP Watcher</a>
-- <a href="https://www.bilibili.com/video/BV1BHJtz6E2S/" target="_blank" title="ESP-HI Low Cost Robot Dog">ESP-HI Low Cost Robot Dog</a>
+## Cấu trúc thư mục chính
 
-<div style="display: flex; justify-content: space-between;">
-  <a href="docs/v1/lichuang-s3.jpg" target="_blank" title="LiChuang ESP32-S3 Development Board">
-    <img src="docs/v1/lichuang-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/espbox3.jpg" target="_blank" title="Espressif ESP32-S3-BOX3">
-    <img src="docs/v1/espbox3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/m5cores3.jpg" target="_blank" title="M5Stack CoreS3">
-    <img src="docs/v1/m5cores3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/atoms3r.jpg" target="_blank" title="AtomS3R + Echo Base">
-    <img src="docs/v1/atoms3r.jpg" width="240" />
-  </a>
-  <a href="docs/v1/magiclick.jpg" target="_blank" title="Magic Button 2.4">
-    <img src="docs/v1/magiclick.jpg" width="240" />
-  </a>
-  <a href="docs/v1/waveshare.jpg" target="_blank" title="Waveshare ESP32-S3-Touch-AMOLED-1.8">
-    <img src="docs/v1/waveshare.jpg" width="240" />
-  </a>
-  <a href="docs/v1/lilygo-t-circle-s3.jpg" target="_blank" title="LILYGO T-Circle-S3">
-    <img src="docs/v1/lilygo-t-circle-s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/xmini-c3.jpg" target="_blank" title="XiaGe Mini C3">
-    <img src="docs/v1/xmini-c3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/movecall-cuican-esp32s3.jpg" target="_blank" title="CuiCan">
-    <img src="docs/v1/movecall-cuican-esp32s3.jpg" width="240" />
-  </a>
-  <a href="docs/v1/wmnologo_xingzhi_1.54.jpg" target="_blank" title="WMnologo-Xingzhi-1.54">
-    <img src="docs/v1/wmnologo_xingzhi_1.54.jpg" width="240" />
-  </a>
-  <a href="docs/v1/sensecap_watcher.jpg" target="_blank" title="SenseCAP Watcher">
-    <img src="docs/v1/sensecap_watcher.jpg" width="240" />
-  </a>
-  <a href="docs/v1/esp-hi.jpg" target="_blank" title="ESP-HI Low Cost Robot Dog">
-    <img src="docs/v1/esp-hi.jpg" width="240" />
-  </a>
-</div>
+```
+main/boards/robot-emo/
+  robot_emo_board.cc     board: động cơ, nhịp tim, thời tiết, công cụ MCP
+  weather_report.*       đọc và định dạng dữ liệu Open-Meteo
+  eye_renderer.*         vẽ đôi mắt (C++ thuần, test được trên máy tính)
+  eyes_display.*         hiển thị đôi mắt trên OLED
+  config.h, config.json  chân GPIO và cấu hình build
+scripts/tests/           test trên máy tính cho phần thời tiết và đôi mắt
+docs/superpowers/        bản thiết kế và kế hoạch của từng tính năng
+```
 
-## Software
+## Tình trạng
 
-### Firmware Flashing
+Đã chạy trên phần cứng: trò chuyện tiếng Việt, từ đánh thức "Hi ESP", di chuyển, đo nhịp tim, thời tiết. Đôi mắt
+OLED mới được thêm, đang được kiểm tra trên phần cứng.
 
-For beginners, it is recommended to use the firmware that can be flashed without setting up a development environment.
+## Ghi công và giấy phép
 
-The firmware connects to the official [xiaozhi.me](https://xiaozhi.me) server by default. Personal users can register an account to use the Qwen real-time model for free.
-
-👉 [Beginner's Firmware Flashing Guide](https://docs.xiaozhi.me/en/firmware/flashing.html)
-
-### Development Environment
-
-- Cursor or VSCode
-- Install the ESP-IDF plugin. The minimum SDK is [ESP-IDF v6.0.1](https://github.com/espressif/esp-idf/releases/tag/v6.0.1); [ESP-IDF `release/v6.1`](https://github.com/espressif/esp-idf/tree/release/v6.1) is recommended. ESP-IDF 5.x is not supported.
-- Linux is better than Windows for faster compilation and fewer driver issues
-- This project uses Google C++ code style, please ensure compliance when submitting code
-
-Use the `release/v6.1` branch rather than the `v6.1` release tag: an ESP32-C3 Wi-Fi initialization failure with that tag is reported in [#2344](https://github.com/78/xiaozhi-esp32/issues/2344). After switching SDK revisions, run `git submodule update --init --recursive` in the ESP-IDF directory, source its `export.sh`, and run `idf.py fullclean` in this project before rebuilding.
-
-### Developer Documentation
-
-- [Custom Board Guide](docs/custom-board.md) - Learn how to create custom boards for XiaoZhi AI
-- [OTA Configuration, Activation, and Firmware Updates](docs/ota.md) - Device bootstrap HTTP API and protocol capability reporting
-- [MCP Protocol IoT Control Usage](docs/mcp-usage.md) - Learn how to control IoT devices via MCP protocol
-- [MCP Protocol Interaction Flow](docs/mcp-protocol.md) - Device-side MCP protocol implementation
-- [MQTT + UDP Hybrid Communication Protocol Document](docs/mqtt-udp.md)
-- [A detailed WebSocket communication protocol document](docs/websocket.md)
-
-## Large Model Configuration
-
-If you already have a XiaoZhi AI chatbot device and have connected to the official server, you can log in to the [xiaozhi.me](https://xiaozhi.me) console for configuration.
-
-👉 [Backend Operation Video Tutorial (Old Interface)](https://www.bilibili.com/video/BV1jUCUY2EKM/)
-
-## Related Open Source Projects
-
-For server deployment on personal computers, refer to the following open-source projects:
-
-- [xinnan-tech/xiaozhi-esp32-server](https://github.com/xinnan-tech/xiaozhi-esp32-server) Python server
-- [joey-zhou/xiaozhi-esp32-server-java](https://github.com/joey-zhou/xiaozhi-esp32-server-java) Java server
-- [AnimeAIChat/xiaozhi-server-go](https://github.com/AnimeAIChat/xiaozhi-server-go) Golang server
-- [hackers365/xiaozhi-esp32-server-golang](https://github.com/hackers365/xiaozhi-esp32-server-golang) Golang server
-
-Other client projects using the XiaoZhi communication protocol:
-
-- [huangjunsen0406/py-xiaozhi](https://github.com/huangjunsen0406/py-xiaozhi) Python client
-- [TOM88812/xiaozhi-android-client](https://github.com/TOM88812/xiaozhi-android-client) Android client
-- [100askTeam/xiaozhi-linux](http://github.com/100askTeam/xiaozhi-linux) Linux client by 100ask
-- [78/xiaozhi-sf32](https://github.com/78/xiaozhi-sf32) Bluetooth chip firmware by Sichuan
-- [QuecPython/solution-xiaozhiAI](https://github.com/QuecPython/solution-xiaozhiAI) QuecPython firmware by Quectel
-
-Custom Assets Tools:
-
-- [78/xiaozhi-assets-generator](https://github.com/78/xiaozhi-assets-generator) Custom Assets Generator (Wake words, fonts, emojis, backgrounds)
-
-## About the Project
-
-This is an open-source ESP32 project, released under the MIT license, allowing anyone to use it for free, including for commercial purposes.
-
-We hope this project helps everyone understand AI hardware development and apply rapidly evolving large language models to real hardware devices.
-
-If you have any ideas or suggestions, please feel free to raise Issues or join our [Discord](https://discord.gg/C759fGMBcZ) or QQ group: 1095994019
-
-## Star History
-
-<a href="https://star-history.com/#78/xiaozhi-esp32&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=78/xiaozhi-esp32&type=Date" />
- </picture>
-</a>
+Dựa trên [XiaoZhi AI (78/xiaozhi-esp32)](https://github.com/78/xiaozhi-esp32), giấy phép MIT, bản quyền
+Shenzhen Xinzhi Future Technology Co., Ltd. Phần sửa đổi của Robot Emo cũng phát hành theo giấy phép MIT; xem
+[LICENSE](LICENSE). Hướng dẫn gốc của XiaoZhi: [tiếng Trung](README_zh.md), [tiếng Nhật](README_ja.md),
+[bản tiếng Anh trên repo gốc](https://github.com/78/xiaozhi-esp32#readme).
