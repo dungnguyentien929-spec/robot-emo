@@ -1,6 +1,7 @@
 #include "wifi_board.h"
 #include "codecs/no_audio_codec.h"
 #include "display/oled_display.h"
+#include "eyes_display.h"
 #include "application.h"
 #include "button.h"
 #include "config.h"
@@ -1130,7 +1131,7 @@ private:
         ESP_ERROR_CHECK(esp_lcd_panel_invert_color(panel_, false));
         ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel_, true));
 
-        display_ = new (std::nothrow) OledDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
+        display_ = new (std::nothrow) EyesDisplay(panel_io_, panel_, DISPLAY_WIDTH, DISPLAY_HEIGHT,
             DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         if (display_ == nullptr) {
             ESP_LOGE(TAG, "Failed to allocate OLED display");

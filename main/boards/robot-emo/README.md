@@ -114,6 +114,33 @@ W (...) RobotEmoBoard: MAX30102 diag: I2C scan 0x08-0x77 ACK: none
 The sensor I2C bus runs at 100 kHz. The LED current is `kLedCurrent` (0x3C,
 about 12 mA) for both LEDs; the ADC range is 16384 nA (`kSpo2Config`, 0x67).
 
+### Display: animated eyes
+
+The OLED shows two large animated eyes (`EyesDisplay` in `eyes_display.{h,cc}`,
+drawn by `EyeRenderer` in `eye_renderer.{h,cc}`). The design, and the approved
+browser mockup, are in `docs/superpowers/specs/2026-11-25-robot-emo-*`.
+
+- The eyes blink every 1.8-5.3 s and glance around when idle. They ease
+  smoothly between shapes.
+- Each emotion the server sends has an expression. funny and silly look like
+  laughing; shocked like surprised; kissy like loving; delicious, relaxed,
+  confident and embarrassed like happy. Unknown names (and `robot_2` at boot)
+  look neutral.
+- While listening, the eyes grow 8% and look straight ahead. While speaking,
+  they bounce gently. Both apply on top of the current emotion.
+- The stock text UI shows through instead of the eyes when something must be
+  read:
+  - in any state other than idle, connecting, listening or speaking (startup,
+    Wi-Fi setup, activation code, upgrade, fatal error);
+  - while a system message is set (alerts, errors, OTA text). It stays until
+    the message is cleared.
+
+  Brief notifications alone do not hide the eyes.
+- A frame (1 KB, I1 canvas) is drawn every 50 ms but sent to the panel only
+  when it changed. A full frame takes ~25 ms on the 400 kHz I2C bus.
+- Renderer host tests: `scripts/tests/test_robot_emo_eyes.py`. They need a host
+  C++23 compiler and are skipped otherwise.
+
 ### Weather
 
 `self.weather.get` answers for one fixed place: Thủ Đức City (latitude 10.85,
