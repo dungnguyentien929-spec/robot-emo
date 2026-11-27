@@ -66,6 +66,32 @@ constexpr const char* kWeatherUrl =
     "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max"
     "&timezone=Asia%2FHo_Chi_Minh&forecast_days=2";
 
+// Speaker volume cap. On a weak supply, the MAX98357A's current peaks at high volume brown
+// out the ESP32 (seen in a log while the robot spoke). Volume scales amplitude by
+// (volume/100)^2, so 50 draws about half the peak current of the default 70.
+constexpr int kMaxOutputVolume = 50;
+
+class RobotEmoAudioCodec : public NoAudioCodecSimplex {
+public:
+    using NoAudioCodecSimplex::NoAudioCodecSimplex;
+
+    void Start() override {
+        NoAudioCodecSimplex::Start();  // loads the saved volume
+        if (output_volume_ > kMaxOutputVolume) {
+            ESP_LOGW(TAG, "Saved output volume %d capped to %d", output_volume_, kMaxOutputVolume);
+            output_volume_ = kMaxOutputVolume;
+        }
+    }
+
+    void SetOutputVolume(int volume) override {
+        if (volume > kMaxOutputVolume) {
+            ESP_LOGW(TAG, "Output volume %d capped to %d", volume, kMaxOutputVolume);
+            volume = kMaxOutputVolume;
+        }
+        NoAudioCodecSimplex::SetOutputVolume(volume);
+    }
+};
+
 class MotorDriver {
 private:
     // Coast time (all inputs LOW) before energizing a new direction, so a running motor is
@@ -1241,7 +1267,7 @@ public:
     }
 
     virtual AudioCodec* GetAudioCodec() override {
-        static NoAudioCodecSimplex audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
+        static RobotEmoAudioCodec audio_codec(AUDIO_INPUT_SAMPLE_RATE, AUDIO_OUTPUT_SAMPLE_RATE,
             AUDIO_I2S_SPK_GPIO_BCLK, AUDIO_I2S_SPK_GPIO_LRCK, AUDIO_I2S_SPK_GPIO_DOUT,
             AUDIO_I2S_MIC_GPIO_SCK, AUDIO_I2S_MIC_GPIO_WS, AUDIO_I2S_MIC_GPIO_DIN);
         return &audio_codec;

@@ -29,6 +29,8 @@ Weak-supply protections (the robot browned out on battery while speaking):
   task (3 KB stack in PSRAM) starts it once the robot has not been speaking for
   0.8 s. A move still waiting after 15 s, or when Wi-Fi drops, is cancelled;
   `self.robot.stop` cancels it too. Log: `Scheduled move <dir> ... wait`.
+- Speaker volume is capped at 50 (`kMaxOutputVolume`), both for
+  `self.audio_speaker.set_volume` and for a higher volume saved in NVS.
 
 ## MCP tools
 
