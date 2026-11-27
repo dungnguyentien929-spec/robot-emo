@@ -457,7 +457,9 @@ private:
         while (true) {
             PollFifo();
             WarnIfNeeded(esp_timer_get_time());
-            vTaskDelay(pdMS_TO_TICKS(10));
+            // The 32-entry FIFO holds 1.28 s at one entry per 40 ms, so a 100 ms poll never
+            // loses samples; PollFifo() timestamps each entry of a batch.
+            vTaskDelay(pdMS_TO_TICKS(kPollMs));
         }
     }
 
@@ -507,7 +509,8 @@ private:
     static constexpr int kI2cTimeoutMs = 20;
     static constexpr int kBootInitAttempts = 3;
     static constexpr uint64_t kInitRetryUs = 2000000;
-    static constexpr uint32_t kTaskStackBytes = 5120;
+    static constexpr uint32_t kTaskStackBytes = 5120;  // in PSRAM, saves internal SRAM
+    static constexpr uint32_t kPollMs = 100;
 
     void ReleaseI2c() {
         if (device_ != nullptr) {
@@ -660,7 +663,9 @@ private:
             return false;
         }
         if (task_ == nullptr &&
-            xTaskCreate(SensorTask, "heart_rate", kTaskStackBytes, this, 1, &task_) != pdPASS) {
+            xTaskCreatePinnedToCoreWithCaps(SensorTask, "heart_rate", kTaskStackBytes, this, 1,
+                                            &task_, tskNO_AFFINITY,
+                                            MALLOC_CAP_SPIRAM) != pdPASS) {
             task_ = nullptr;
             init_error_ = "Failed to create MAX30102 sensor task";
             ReleaseI2c();
@@ -669,7 +674,7 @@ private:
         init_error_.clear();
         ready_ = true;
         ESP_LOGI(
-            TAG, "MAX30102 found at 0x57 (I2C %lu Hz); sensor task stack=%lu bytes, priority=1",
+            TAG, "MAX30102 found at 0x57 (I2C %lu Hz); sensor task stack=%lu bytes (PSRAM), priority=1",
             static_cast<unsigned long>(kI2cSpeedHz), static_cast<unsigned long>(kTaskStackBytes));
         return true;
     }
