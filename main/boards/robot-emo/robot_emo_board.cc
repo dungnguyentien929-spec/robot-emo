@@ -146,10 +146,10 @@ private:
             levels[0] = true;  levels[1] = false; levels[2] = true;  levels[3] = false;
         } else if (direction == "backward") {
             levels[0] = false; levels[1] = true;  levels[2] = false; levels[3] = true;
-        } else if (direction == "left") {
-            levels[0] = false; levels[1] = true;  levels[2] = true;  levels[3] = false;
-        } else if (direction == "right") {
+        } else if (direction == "left") {  // levels swapped with right after a hardware test
             levels[0] = true;  levels[1] = false; levels[2] = false; levels[3] = true;
+        } else if (direction == "right") {
+            levels[0] = false; levels[1] = true;  levels[2] = true;  levels[3] = false;
         } else {
             return false;
         }
@@ -1213,12 +1213,19 @@ private:
             "Use when the user asks the robot to move forward, backward, or turn left/right. "
             "Direction must be exactly one of: forward, backward, left, right. "
             "The movement starts once the robot has finished speaking (to protect its power supply) "
-            "and automatically stops after duration_ms (500-5000; default 3000).",
+            "and automatically stops after duration_ms (500-5000; default 3000). "
+            "left/right spin the robot in place: a 90 degree turn takes about 700 ms, "
+            "so for a plain turn use duration_ms 700.",
             PropertyList({Property("direction", kPropertyTypeString),
                           Property("duration_ms", kPropertyTypeInteger, 3000, 500, 5000)}),
             [this](const PropertyList& properties) -> ToolResult {
                 const std::string direction = properties["direction"].value<std::string>();
-                const int duration_ms = properties["duration_ms"].value<int>();
+                int duration_ms = properties["duration_ms"].value<int>();
+                // shortcut: 3000 is the default, so an explicit 3000 ms turn also becomes 700 ms
+                // (one spin took under 3 s on hardware); give turns their own property if needed.
+                if ((direction == "left" || direction == "right") && duration_ms == 3000) {
+                    duration_ms = 700;
+                }
                 if (!WifiManager::GetInstance().IsConnected()) {
                     ESP_LOGI(TAG,
                              "MCP self.robot.move args={direction:%s,duration_ms:%d} result=error: "
