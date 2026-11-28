@@ -15,6 +15,7 @@
 #include <esp_heap_caps.h>
 #include <driver/gpio.h>
 #include <driver/i2c_master.h>
+#include <driver/ledc.h>
 #include <esp_lcd_panel_ops.h>
 #include <esp_lcd_panel_vendor.h>
 #include <freertos/semphr.h>
@@ -44,6 +45,11 @@ constexpr bool kInvertMotorB = true;   // Motor B: IN3/IN4 = GPIO13/GPIO14
 
 constexpr gpio_num_t kMotorPins[] = {
     GPIO_NUM_11, GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_14
+};
+// One LEDC channel per motor input; the board uses no other LEDC channel or timer.
+constexpr ledc_timer_t kMotorPwmTimer = LEDC_TIMER_1;
+constexpr ledc_channel_t kMotorChannels[] = {
+    LEDC_CHANNEL_4, LEDC_CHANNEL_5, LEDC_CHANNEL_6, LEDC_CHANNEL_7
 };
 constexpr uint8_t kMax30102Address = 0x57;
 constexpr uint8_t kMax30102PartId = 0x15;
@@ -105,8 +111,15 @@ private:
     static constexpr int64_t kMaxWaitUs = 15000000;
     static constexpr uint32_t kSchedulerPollMs = 100;
     static constexpr uint32_t kSchedulerStackBytes = 3072;  // in PSRAM
+    // Soft start: the LEDC hardware raises the duty from 0 by 1 every kRampCycles PWM periods,
+    // kRampSteps times (10-bit, ends at 1023/1024), so 1023 x 2 / 5 kHz = ~410 ms. The start
+    // current of both motors otherwise pulls the shared 5 V boost down to 3-4 V (measured).
+    static constexpr uint32_t kPwmHz = 5000;
+    static constexpr uint32_t kRampSteps = 1023;
+    static constexpr uint32_t kRampCycles = 2;
 
     SemaphoreHandle_t mutex_ = nullptr;
+    bool pwm_ready_ = false;
     esp_timer_handle_t timer_ = nullptr;
     TaskHandle_t scheduler_ = nullptr;
     bool ready_ = false;
@@ -208,19 +221,31 @@ private:
         }
     }
 
+    // Once a pin is routed to LEDC, gpio_set_level no longer drives it, so stop the channel too.
     void SetAllLow() {
-        for (gpio_num_t pin : kMotorPins) {
-            esp_err_t err = gpio_set_level(pin, 0);
+        for (size_t i = 0; i < 4; ++i) {
+            esp_err_t err = gpio_set_level(kMotorPins[i], 0);
+            if (err == ESP_OK && pwm_ready_) {
+                err = ledc_stop(LEDC_LOW_SPEED_MODE, kMotorChannels[i], 0);
+            }
             if (err != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to set motor GPIO%d LOW: %s", pin, esp_err_to_name(err));
+                ESP_LOGE(TAG, "Failed to set motor GPIO%d LOW: %s", kMotorPins[i],
+                         esp_err_to_name(err));
             }
         }
     }
 
+    // Inputs set HIGH ramp up from 0 (soft start); the others are held LOW.
     esp_err_t SetOutputs(bool in1, bool in2, bool in3, bool in4) {
-        const uint32_t levels[] = {in1, in2, in3, in4};
+        const bool levels[] = {in1, in2, in3, in4};
         for (size_t i = 0; i < 4; ++i) {
-            esp_err_t err = gpio_set_level(kMotorPins[i], levels[i]);
+            esp_err_t err = levels[i]
+                ? ledc_set_fade(LEDC_LOW_SPEED_MODE, kMotorChannels[i], 0, LEDC_DUTY_DIR_INCREASE,
+                                kRampSteps, kRampCycles, 1)
+                : ledc_stop(LEDC_LOW_SPEED_MODE, kMotorChannels[i], 0);
+            if (err == ESP_OK && levels[i]) {
+                err = ledc_update_duty(LEDC_LOW_SPEED_MODE, kMotorChannels[i]);
+            }
             if (err != ESP_OK) {
                 SetAllLow();
                 return err;
@@ -260,6 +285,38 @@ public:
             return;
         }
 
+        SetAllLow();
+
+        const ledc_timer_config_t pwm_timer = {
+            .speed_mode = LEDC_LOW_SPEED_MODE,
+            .duty_resolution = LEDC_TIMER_10_BIT,
+            .timer_num = kMotorPwmTimer,
+            .freq_hz = kPwmHz,
+            .clk_cfg = LEDC_AUTO_CLK,
+        };
+        err = ledc_timer_config(&pwm_timer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to configure motor PWM timer: %s", esp_err_to_name(err));
+            return;
+        }
+        for (size_t i = 0; i < 4; ++i) {
+            // duty 0: the pin stays LOW when LEDC takes it over.
+            const ledc_channel_config_t channel = {
+                .gpio_num = kMotorPins[i],
+                .speed_mode = LEDC_LOW_SPEED_MODE,
+                .channel = kMotorChannels[i],
+                .timer_sel = kMotorPwmTimer,
+                .duty = 0,
+                .hpoint = 0,
+            };
+            err = ledc_channel_config(&channel);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure motor PWM on GPIO%d: %s", kMotorPins[i],
+                         esp_err_to_name(err));
+                return;  // channels already set up hold duty 0, i.e. LOW
+            }
+        }
+        pwm_ready_ = true;
         SetAllLow();
 
         mutex_ = xSemaphoreCreateMutex();
